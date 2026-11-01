@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Glint social preview</title>
+<!-- 1280x640. Background: Hokusai, "Under the Wave off Kanagawa" (public domain, Wikimedia Commons). -->
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Lora:ital,wght@0,600;1,500&family=JetBrains+Mono:wght@500&display=swap" rel="stylesheet">
+<style>
+  html,body{margin:0;width:1280px;height:640px;overflow:hidden;background:#0b1b4a}
+  .card{position:relative;width:1280px;height:640px;overflow:hidden;
+    background:#0b1b4a url("https://commons.wikimedia.org/wiki/Special:FilePath/Tsunami_by_hokusai_19th_century.jpg?width=1800") no-repeat;
+    background-size:1500px auto;background-position:right -40px top -120px}
+  .shade{position:absolute;inset:0;background:linear-gradient(90deg,rgba(11,27,74,.96) 0%,rgba(11,27,74,.88) 38%,rgba(11,27,74,.35) 66%,rgba(11,27,74,0) 100%)}
+  .text{position:absolute;left:84px;top:118px;color:#f7ecd0;font-family:'Lora',Georgia,serif}
+  h1{margin:0;font-size:150px;line-height:1;font-weight:600;letter-spacing:-3px}
+  h1 span{color:#9cc3ff;font-size:70px;vertical-align:top;position:relative;top:14px;margin-right:6px}
+  p.tag{margin:18px 0 0;font-size:40px;font-style:italic;font-weight:500;color:#f7ecd0}
+  p.sub{margin:14px 0 0;font-size:25px;font-style:italic;color:#bcd0f5;max-width:640px;line-height:1.4}
+  .pill{position:absolute;left:84px;bottom:64px;font-family:'JetBrains Mono',monospace;font-size:21px;color:#0b1b4a;background:#f7ecd0;padding:12px 22px;border-radius:999px}
+  .credit{position:absolute;right:22px;bottom:14px;font:13px 'Lora',serif;color:#f7ecd0;opacity:.75}
+</style></head>
+<body><div class="card"><div class="shade"></div>
+  <div class="text"><h1><span>✦</span>Glint</h1>
+    <p class="tag">Your monitor. Your colours. One tiny tool.</p>
+    <p class="sub">Resolution, refresh rate, brightness and colour, themed like your rice.</p></div>
+  <div class="pill">curl -fsSL …/install.sh | bash</div>
+  <div class="credit">Art: Hokusai, c. 1830 (public domain)</div>
+</div></body></html>

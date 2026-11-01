@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# Fake hyprctl for offline tests. State lives in $FAKE_STATE/screen
+S="$FAKE_STATE/screen"
+[ -f "$S" ] || echo "2560 1440 60.00 0 0 1 0" > "$S"
+read W H R X Y SC TR < "$S"
+case "$1" in
+  monitors)
+    cat <<JSON
+[{"name":"DP-1","description":"GIGA-BYTE G27Q","make":"GBT","model":"G27Q","width":$W,"height":$H,"refreshRate":$R,"x":$X,"y":$Y,"scale":$SC,"transform":$TR,
+"availableModes":["2560x1440@143.98Hz","2560x1440@119.99Hz","2560x1440@59.95Hz","1920x1080@143.98Hz","1920x1080@60.00Hz"]}]
+JSON
+    ;;
+  keyword)
+    # monitor spec: name,WxH@R,XxY,scale,transform,N
+    IFS=, read -r _ MODE POS SCL _ TRN <<< "$3"
+    echo "${MODE%%x*} $(echo ${MODE#*x} | cut -d@ -f1) $(echo $MODE | cut -d@ -f2) ${POS%%x*} ${POS##*x} $SCL $TRN" > "$S"
+    echo ok ;;
+  binds) echo '[{"modmask":72,"key":"N","arg":"notes-app","dispatcher":"exec"},{"modmask":64,"key":"Q","arg":"kitty","dispatcher":"exec"}]' ;;
+  reload) echo ok ;;
+  *) echo "unsupported" >&2; exit 1 ;;
+esac

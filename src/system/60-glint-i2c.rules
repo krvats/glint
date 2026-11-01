@@ -1,0 +1,2 @@
+# Lets your normal user talk to monitors over DDC/CI without sudo.
+KERNEL=="i2c-[0-9]*", GROUP="i2c", MODE="0660", TAG+="uaccess"

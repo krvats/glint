@@ -1,0 +1,5 @@
+post_install() {
+  echo ">> Glint: add yourself to the i2c group, then log out and in:  sudo usermod -aG i2c \$USER"
+  echo ">> Then run:  glint keys on && glint sync on && glint doctor"
+}
+post_upgrade() { post_install; }

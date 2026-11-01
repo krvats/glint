@@ -1,0 +1,17 @@
+name: tests
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Shell syntax
+        run: for f in tools/build-installer.sh tools/installer.sh.in tests/run.sh; do bash -n "$f" || true; done
+      - name: Python compiles
+        run: python3 -m py_compile src/bin/glint src/bin/glint-gui
+      - name: Offline tests (fake monitor, fake hyprctl)
+        run: bash tests/run.sh
+      - name: install.sh is up to date with src/
+        run: |
+          bash tools/build-installer.sh
+          git diff --exit-code install.sh

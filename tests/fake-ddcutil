@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# Pretends to be ddcutil with one fake Gigabyte G27Q, for testing without hardware.
+S="${FAKE_STATE:-/tmp/fake-ddc}"; mkdir -p "$S"
+if [ "$1" = detect ]; then
+cat <<'E'
+Display 1
+   I2C bus:             /dev/i2c-5
+   DRM connector:       card1-DP-1
+   Monitor:             GBT:G27Q:24120B001234
+
+E
+exit 0; fi
+[ "$1" = "--bus" ] && shift 2
+case "$1" in
+  capabilities) echo "Model: G27Q"; echo "Feature: 10 (Brightness)";;
+  getvcp)
+    v=$(cat "$S/$2" 2>/dev/null)
+    if [ -z "$v" ]; then case "$2" in 14) v=5;; 10|12) v=50;; *) v=100;; esac; fi
+    if [ "$2" = 14 ]; then printf 'VCP 14 SNC x%02x\n' "$v"; else echo "VCP $2 C $v 100"; fi;;
+  setvcp) echo "$3" > "$S/$2";;
+esac

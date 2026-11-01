@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Glint
+GenericName=Monitor Control
+Comment=Resolution, refresh rate, brightness and colour for your monitor, themed like your rice
+Exec=glint-gui
+Icon=video-display
+Terminal=false
+Categories=Settings;HardwareSettings;GTK;
+Keywords=monitor;display;screen;resolution;refresh rate;brightness;contrast;ddc;hyprland;caelestia;
+StartupWMClass=io.github.krvats.glint

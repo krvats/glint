@@ -1,0 +1,8 @@
+{
+  "match": "G27Q",
+  "notes": [
+    "If the values above were read, DDC/CI is already on. Some monitors also have a toggle: Menu > System > DDC/CI.",
+    "Use a DisplayPort or HDMI cable straight to the graphics card, not a dock or adapter.",
+    "OSD-only features (Black Equalizer, Overdrive, Aim Stabilizer, FreeSync) are not standard DDC codes. Run `glint caps` and open an issue with the output to get them added."
+  ]
+}

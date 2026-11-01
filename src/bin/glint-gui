@@ -1,0 +1,355 @@
+#!/usr/bin/env python3
+"""Glint: small, cute, and it wears your rice. Colours follow Caelestia (or pywal, or your GTK theme) live."""
+import json, os, pathlib, shutil, subprocess, sys, threading
+import gi
+gi.require_version("Gtk", "4.0"); gi.require_version("Adw", "1")
+from gi.repository import Adw, Gdk, Gio, GLib, Gtk
+
+H = pathlib.Path.home()
+CFG = pathlib.Path(os.environ.get("XDG_CONFIG_HOME", H / ".config")) / "cdisplay"
+SCHEME = H / ".local/state/caelestia/scheme.json"
+WAL = H / ".cache/wal/colors.json"
+_here = os.path.join(os.path.dirname(os.path.realpath(__file__)), "cdisplay")
+CLI = _here if os.path.exists(_here) else (shutil.which("cdisplay") or "cdisplay")
+LABELS = {"brightness": "Brightness", "contrast": "Contrast", "red": "Red", "green": "Green", "blue": "Blue"}
+COLOURS = ["srgb", "native", "4000k", "5000k", "6500k", "7500k", "8200k", "9300k", "11500k", "user"]
+SOURCES = ["auto", "caelestia", "pywal", "gtk", "system"]
+
+
+def cli(*args):
+    r = subprocess.run([CLI, *args], capture_output=True, text=True)
+    return r.returncode, r.stdout, r.stderr.strip()
+
+
+# ---------------------------------------------------------------- theme: wears your rice, live
+def hexc(c): return "#%02x%02x%02x" % tuple(max(0, min(255, round(x))) for x in c)
+
+def rgba(h, a):
+    h = h.lstrip("#"); r, g, b = (int(h[i:i + 2], 16) for i in (0, 2, 4)); return f"rgba({r},{g},{b},{a})"
+
+def theme_cfg():
+    try: return json.load(open(CFG / "theme.json"))
+    except Exception: return {}
+
+def watched():
+    out = []
+    for f in (SCHEME, WAL, CFG / "theme.json", CFG / "theme.css"):
+        try: out.append(f.stat().st_mtime_ns)
+        except OSError: out.append(0)
+    return tuple(out)
+
+def build_css(t):
+    p, r, glass = t.get("palette"), int(t.get("radius", 18)), float(t.get("glass", 1.0))
+    css = ""
+    if p:
+        win = rgba(p["bg"], glass) if glass < 1 else p["bg"]
+        m = {"window_bg": win, "window_fg": p["fg"], "view_bg": p["view"], "view_fg": p["fg"], "headerbar_bg": p["header"],
+             "headerbar_fg": p["fg"], "card_bg": rgba(p["card"], max(glass, .55)) if glass < 1 else p["card"], "card_fg": p["fg"],
+             "popover_bg": p["card"], "popover_fg": p["fg"], "dialog_bg": p["card"], "dialog_fg": p["fg"], "accent_bg": p["accent"],
+             "accent_fg": p["accentfg"], "accent": p["accent"], "sidebar_bg": p["header"], "sidebar_fg": p["fg"]}
+        css += "".join(f"@define-color {k}_color {v};\n" for k, v in m.items())
+        css += f"@define-color destructive_bg_color {p['error']};\n@define-color glint_two {p['secondary']};\n@define-color glint_three {p['tertiary']};\n"
+    else:
+        css += "@define-color glint_two @accent_bg_color;\n@define-color glint_three @accent_bg_color;\n"
+    css += f"""
+window {{ background: @window_bg_color; }}
+.glint-hero {{ border-radius: {r + 6}px; padding: 18px 20px; color: @accent_fg_color;
+  background-image: linear-gradient(120deg, @accent_bg_color 0%, @glint_two 55%, @glint_three 100%); }}
+.glint-hero label.title {{ font-size: 26px; font-weight: 800; letter-spacing: -0.5px; }}
+.glint-hero label.sub {{ opacity: .85; }}
+.glint-chip {{ border-radius: 999px; padding: 2px 10px; background: alpha(@accent_fg_color, .18); font-weight: 600; }}
+.glint-dot {{ min-width: 18px; min-height: 18px; border-radius: 999px; }}
+preferencesgroup > box > box > list, list.boxed-list {{ border-radius: {r}px; }}
+row:first-child {{ border-top-left-radius: {r}px; border-top-right-radius: {r}px; }}
+row:last-child {{ border-bottom-left-radius: {r}px; border-bottom-right-radius: {r}px; }}
+button {{ border-radius: {max(r - 4, 6)}px; }} button.pill {{ border-radius: 999px; padding: 8px 20px; font-weight: 600; }}
+button.pill.suggested-action {{ box-shadow: 0 2px 14px -4px @accent_bg_color; }}
+entry, row.entry {{ border-radius: {max(r - 4, 6)}px; }}
+scale trough {{ min-height: 8px; border-radius: 999px; }} scale highlight {{ border-radius: 999px; background: @accent_bg_color; }}
+scale slider {{ min-width: 20px; min-height: 20px; border-radius: 999px; background: @accent_bg_color; box-shadow: 0 0 0 3px alpha(@accent_bg_color, .25); }}
+scale.red highlight, scale.red slider {{ background: #ff6b81; }} scale.green highlight, scale.green slider {{ background: #5fd38d; }}
+scale.blue highlight, scale.blue slider {{ background: #6ea8ff; }}
+headerbar {{ box-shadow: none; }} dialog, window.dialog {{ border-radius: {r + 4}px; }}
+"""
+    if p:
+        css += "".join(f".dot-{k} {{ background: {p[k]}; border: 1px solid alpha(@window_fg_color, .25); }}\n" for k in ("bg", "card", "accent", "secondary", "tertiary", "fg"))
+    try: css += (CFG / "theme.css").read_text()   # your own touches always win
+    except Exception: pass
+    return css
+
+
+class Theme:
+    def __init__(self):
+        self.prov = Gtk.CssProvider(); self.t = {}; self.last = None; self.listeners = []
+        Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), self.prov, Gtk.STYLE_PROVIDER_PRIORITY_USER)
+        self.refresh(force=True)
+        GLib.timeout_add_seconds(2, self.poll)   # cheap and reliable: notices scheme changes however they are written
+
+    def poll(self):
+        w = watched()
+        if w != self.last: self.refresh()
+        return True
+
+    def refresh(self, force=False):
+        self.last = watched()
+        def work():
+            rc, out, _ = cli("theme", "--json")
+            if rc == 0 and out.strip(): GLib.idle_add(self.apply, json.loads(out))
+        threading.Thread(target=work, daemon=True).start()
+
+    def apply(self, t):
+        self.t = t; p = t.get("palette")
+        sm = Adw.StyleManager.get_default()
+        sm.set_color_scheme(Adw.ColorScheme.DEFAULT if not p else (Adw.ColorScheme.FORCE_LIGHT if t.get("mode") == "light" else Adw.ColorScheme.FORCE_DARK))
+        css = build_css(t)
+        try: self.prov.load_from_string(css)
+        except AttributeError: self.prov.load_from_data(css.encode())
+        for f in self.listeners: f(t)
+
+
+# ---------------------------------------------------------------- window
+class Win(Adw.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app, title="Glint", default_width=600, default_height=780)
+        self.timers = {}; self.theme = app.theme; self.sync_on = False
+        view = Adw.ToolbarView(); bar = Adw.HeaderBar()
+        refresh = Gtk.Button(icon_name="view-refresh-symbolic", tooltip_text="Reload"); refresh.connect("clicked", lambda *_: self.load())
+        bar.pack_start(refresh)
+        self.stack = Adw.ViewStack(vexpand=True); self.pages = {}
+        for key, title, icon in (("screen", "Screen", "video-display-symbolic"), ("colour", "Colour", "weather-clear-symbolic"),
+                                 ("keys", "Keys", "input-keyboard-symbolic"), ("look", "Look", "applications-graphics-symbolic")):
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16, margin_top=16, margin_bottom=16, margin_start=16, margin_end=16)
+            sc = Gtk.ScrolledWindow(vexpand=True); sc.set_child(Adw.Clamp(child=box, maximum_size=640))
+            self.stack.add_titled_with_icon(sc, key, title, icon); self.pages[key] = box
+        bar.set_title_widget(Adw.ViewSwitcher(stack=self.stack, policy=Adw.ViewSwitcherPolicy.WIDE))
+        view.add_top_bar(bar)
+        self.status = Gtk.Label(label="", margin_bottom=8, margin_top=4); self.status.add_css_class("dim-label")
+        hero = Gtk.Box(spacing=14, margin_top=12, margin_start=16, margin_end=16); hero.add_css_class("glint-hero")
+        img = Gtk.Image.new_from_icon_name("video-display-symbolic"); img.set_pixel_size(44); hero.append(img)
+        tb = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, valign=Gtk.Align.CENTER, hexpand=True)
+        t1 = Gtk.Label(label="Glint", xalign=0); t1.add_css_class("title")
+        t2 = Gtk.Label(label="your monitor, wearing your rice", xalign=0); t2.add_css_class("sub")
+        tb.append(t1); tb.append(t2); hero.append(tb)
+        self.chip = Gtk.Label(valign=Gtk.Align.CENTER); self.chip.add_css_class("glint-chip"); hero.append(self.chip)
+        self.theme.listeners.append(self.on_theme); self.on_theme(self.theme.t)
+        col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL); col.append(hero); col.append(self.stack); col.append(self.status)
+        view.set_content(col); self.set_content(view)
+        self.load()
+
+    def on_theme(self, t):
+        if not t: self.chip.set_text("loading..."); return
+        self.chip.set_text("your system theme" if t["source"] == "system" else f"{t['source']} · {t['mode']}")
+
+    def say(self, text): GLib.idle_add(self.status.set_text, text)
+
+    def load(self):
+        self.say("Reading your monitor...")
+        def work():
+            rc, out, err = cli("get", "--json")
+            _, prof, _ = cli("profile", "list", "--json")
+            _, auto, _ = cli("auto", "status")
+            src, sout, _ = cli("screen", "list", "--json")
+            krc, kout, _ = cli("keys", "list", "--json")
+            _, so, _ = cli("sync", "status"); self.sync_on = so.strip() == "on"
+            screens = json.loads(sout)["outputs"] if src == 0 and sout.strip() else []
+            keys = json.loads(kout) if krc == 0 and kout.strip() else None
+            disp = json.loads(out)["displays"] if rc == 0 else []
+            GLib.idle_add(self.build, disp, json.loads(prof or "[]") if rc == 0 else [], auto.strip() == "on", screens, keys,
+                          "" if rc == 0 else (err or "Brightness and colour need DDC/CI. Run `cdisplay doctor`."))
+        threading.Thread(target=work, daemon=True).start()
+
+    def clear(self):
+        for box in self.pages.values():
+            while (c := box.get_first_child()): box.remove(c)
+
+    def note(self, page, text):
+        l = Gtk.Label(label=text, wrap=True); l.add_css_class("dim-label"); self.pages[page].append(l)
+
+    # ---- screen
+    def build_screen(self, o):
+        grp = Adw.PreferencesGroup(title=o["label"], description=f"Output {o['name']}. Kept settings survive reboots.")
+        res_list = sorted(o["modes"], key=lambda r: tuple(int(x) for x in r.split("x")), reverse=True)
+        cur_res = f"{o['width']}x{o['height']}"
+        res = Adw.ComboRow(title="Resolution", model=Gtk.StringList.new(res_list))
+        res.set_selected(res_list.index(cur_res) if cur_res in res_list else 0)
+        hz = Adw.ComboRow(title="Refresh rate (Hz)")
+        def fill_hz(*_):
+            rates = sorted(o["modes"][res_list[res.get_selected()]], key=float, reverse=True)
+            hz.set_model(Gtk.StringList.new(rates))
+            hz.set_selected(min(range(len(rates)), key=lambda i: abs(float(rates[i]) - o["refresh"])))
+        res.connect("notify::selected", fill_hz); fill_hz()
+        scale = Adw.SpinRow.new_with_range(0.5, 3.0, 0.05); scale.set_title("Scale"); scale.set_digits(2); scale.set_value(float(o["scale"]))
+        rot = Adw.ComboRow(title="Rotation", model=Gtk.StringList.new(["Normal", "Rotate 90", "Rotate 180", "Rotate 270"]))
+        rot.set_selected(min(int(o["transform"]), 3))
+        pos = Adw.EntryRow(title="Position (x by y, e.g. 0x0 or 2560x0)"); pos.set_text(f"{o['x']}x{o['y']}")
+        btn = Gtk.Button(label="Apply", halign=Gtk.Align.END, margin_top=8); btn.add_css_class("suggested-action"); btn.add_css_class("pill")
+        def now():
+            return ["--resolution", res_list[res.get_selected()], "--refresh", hz.get_model().get_string(hz.get_selected()),
+                    "--scale", f"{scale.get_value():.2f}", "--rotate", str(rot.get_selected()), "--position", pos.get_text().strip() or "auto"]
+        prev = ["--resolution", cur_res, "--refresh", str(o["refresh"]), "--scale", str(o["scale"]), "--rotate", str(o["transform"]), "--position", f"{o['x']}x{o['y']}"]
+        btn.connect("clicked", lambda *_: self.try_screen(o["name"], now(), prev))
+        for r in (res, hz, scale, rot, pos): grp.add(r)
+        grp.add(btn); return grp
+
+    def try_screen(self, name, new, prev):
+        self.say("Applying...")
+        def work():
+            rc, _, err = cli("screen", "set", name, *new, "--no-save")
+            if rc != 0: self.say(err or "Could not apply"); return
+            GLib.idle_add(self.confirm, name, new, prev)
+        threading.Thread(target=work, daemon=True).start()
+
+    def confirm(self, name, new, prev):
+        dlg = Adw.MessageDialog(transient_for=self, heading="Keep these screen settings?", body="Reverting in 12 seconds if you do nothing.")
+        dlg.add_response("revert", "Revert"); dlg.add_response("keep", "Keep")
+        dlg.set_response_appearance("keep", Adw.ResponseAppearance.SUGGESTED); dlg.set_default_response("revert")
+        left = [12]
+        def tick():
+            left[0] -= 1
+            if left[0] <= 0: dlg.close(); return False
+            dlg.set_body(f"Reverting in {left[0]} seconds if you do nothing."); return True
+        tid = GLib.timeout_add_seconds(1, tick)
+        def done(d, resp):
+            if left[0] > 0: GLib.source_remove(tid)
+            def work():
+                if resp == "keep": rc, _, err = cli("screen", "set", name, *new); self.say("Saved" if rc == 0 else err)
+                else: cli("screen", "set", name, *prev, "--no-save"); self.say("Reverted")
+                GLib.idle_add(self.load)
+            threading.Thread(target=work, daemon=True).start()
+        dlg.connect("response", done); dlg.present()
+
+    # ---- keys
+    def build_keys(self, keys):
+        if not keys: self.note("keys", "Shortcuts need Hyprland running."); return
+        sw = Adw.SwitchRow(title="Shortcuts on", subtitle="Never overrides a shortcut you already use. Taken ones are skipped.")
+        sw.set_active(keys["enabled"])
+        sw.connect("notify::active", lambda r, _p: self.run_bg("keys", "on" if r.get_active() else "off"))
+        g0 = Adw.PreferencesGroup(); g0.add(sw); self.pages["keys"].append(g0)
+        g = Adw.PreferencesGroup(title="Change any of them", description="Write it like SUPER ALT, M. Press Enter or the tick to save.")
+        for k in keys["keys"]:
+            row = Adw.EntryRow(title=k["label"] + ("   (taken, skipped)" if k["status"].startswith("TAKEN") else ""), show_apply_button=True)
+            row.set_text(k["combo"])
+            row.connect("apply", lambda r, name=k["name"]: self.run_bg("keys", "set", name, r.get_text().strip() or "none"))
+            g.add(row)
+        self.pages["keys"].append(g)
+
+    def run_bg(self, *args):
+        def work():
+            rc, out, err = cli(*args); self.say(out.strip() if rc == 0 else err)
+            if rc == 0: GLib.idle_add(self.load)
+        threading.Thread(target=work, daemon=True).start()
+
+    # ---- look
+    def build_look(self):
+        cfg = theme_cfg(); t = self.theme.t or {}; p = t.get("palette")
+        g = Adw.PreferencesGroup(title="Colours", description="Follows your setup live. Change the Caelestia scheme and this window changes with it.")
+        sw = Adw.ActionRow(title="Right now", subtitle=("Wearing " + t.get("name", "")) if p else "Using your GTK / libadwaita theme")
+        if p:
+            box = Gtk.Box(spacing=6, valign=Gtk.Align.CENTER)
+            for k in ("bg", "card", "accent", "secondary", "tertiary", "fg"):
+                d = Gtk.Box(); d.add_css_class("glint-dot"); d.add_css_class(f"dot-{k}"); box.append(d)
+            sw.add_suffix(box)
+        g.add(sw)
+        src = Adw.ComboRow(title="Take colours from", subtitle="Auto tries Caelestia, then pywal, then your gtk.css",
+                           model=Gtk.StringList.new(["Auto", "Caelestia", "Pywal", "My gtk.css", "System theme"]))
+        src.set_selected(SOURCES.index(cfg.get("source", "auto")) if cfg.get("source", "auto") in SOURCES else 0)
+        src.connect("notify::selected", lambda r, _p: self.run_quiet("theme", "set", "source", SOURCES[r.get_selected()])); g.add(src)
+        rad = Adw.SpinRow.new_with_range(0, 32, 1); rad.set_title("Roundness"); rad.set_value(cfg.get("radius", 18))
+        rad.connect("notify::value", lambda r, _p: self.schedule("rad", lambda: self.run_quiet("theme", "set", "radius", str(int(r.get_value()))))); g.add(rad)
+        gl = Adw.SpinRow.new_with_range(0.3, 1.0, 0.05); gl.set_title("Glass"); gl.set_subtitle("Lower = see-through, if your compositor blurs windows"); gl.set_digits(2)
+        gl.set_value(cfg.get("glass", 1.0))
+        gl.connect("notify::value", lambda r, _p: self.schedule("glass", lambda: self.run_quiet("theme", "set", "glass", f"{r.get_value():.2f}"))); g.add(gl)
+        acc = Adw.ActionRow(title="Accent colour", subtitle="Reset goes back to your theme's own")
+        cb = Gtk.ColorDialogButton(dialog=Gtk.ColorDialog(), valign=Gtk.Align.CENTER)
+        if cfg.get("accent"):
+            c = Gdk.RGBA(); c.parse(cfg["accent"]); cb.set_rgba(c)
+        cb.connect("notify::rgba", lambda b, _p: self.schedule("acc", lambda: self.run_quiet("theme", "set", "accent", hexc([b.get_rgba().red * 255, b.get_rgba().green * 255, b.get_rgba().blue * 255]))))
+        rs = Gtk.Button(label="Reset", valign=Gtk.Align.CENTER); rs.connect("clicked", lambda *_: self.run_quiet("theme", "set", "accent", "reset"))
+        acc.add_suffix(rs); acc.add_suffix(cb); g.add(acc)
+        self.pages["look"].append(g)
+        sg = Adw.PreferencesGroup(title="Whole desktop", description="Make GTK, Qt and wal-aware apps wear the same colours, and keep them in sync.")
+        sync = Adw.SwitchRow(title="Sync other apps", subtitle="Needs Caelestia or pywal. Turn off to put your old GTK css back.")
+        sync.set_active(self.sync_on)
+        sync.connect("notify::active", lambda r, _p: self.run_bg("sync", "on" if r.get_active() else "off")); sg.add(sync)
+        self.pages["look"].append(sg)
+        self.note("look", f"More: {CFG}/theme.json (colours, accent) or your own CSS in {CFG}/theme.css")
+
+    def run_quiet(self, *args):
+        threading.Thread(target=lambda: cli(*args), daemon=True).start()
+
+    # ---- build
+    def build(self, displays, profiles, auto, screens, keys, note):
+        self.clear(); self.status.set_text(note)
+        for o in screens: self.pages["screen"].append(self.build_screen(o))
+        if not screens: self.note("screen", "Screen settings need Hyprland running.")
+        for d in displays:
+            grp = Adw.PreferencesGroup(title=d["name"])
+            for feat, label in LABELS.items():
+                v = d["values"].get(feat)
+                if not v: continue
+                row = Adw.ActionRow(title=label, icon_name={"brightness": "display-brightness-symbolic", "contrast": "view-reveal-symbolic"}.get(feat))
+                sc = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 100, 1)
+                if feat in ("red", "green", "blue"): sc.add_css_class(feat)
+                sc.set_value(v["percent"]); sc.set_size_request(280, -1); sc.set_draw_value(True); sc.set_valign(Gtk.Align.CENTER)
+                sc.connect("value-changed", self.on_slide, d["id"], feat); row.add_suffix(sc); grp.add(row)
+            if "colour" in d["values"]:
+                row = Adw.ComboRow(title="Colour temperature", model=Gtk.StringList.new(COLOURS))
+                cur = d["values"]["colour"]["name"]
+                row.set_selected(COLOURS.index(cur) if cur in COLOURS else Gtk.INVALID_LIST_POSITION)
+                row.connect("notify::selected", self.on_colour, d["id"]); grp.add(row)
+            self.pages["colour"].append(grp)
+        if not displays: self.note("colour", "Brightness and colour need DDC/CI on your monitor. Run `cdisplay doctor` for help.")
+        if profiles:
+            grp = Adw.PreferencesGroup(title="One-tap looks")
+            flow = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE, max_children_per_line=3, row_spacing=8, column_spacing=8)
+            for p in profiles:
+                b = Gtk.Button(label=p.capitalize()); b.add_css_class("pill"); b.add_css_class("suggested-action")
+                b.connect("clicked", self.on_profile, p); flow.append(b)
+            grp.add(flow); self.pages["colour"].append(grp)
+        sync = Adw.PreferencesGroup(title="Sync with Caelestia")
+        sw = Adw.SwitchRow(title="Match monitor to light/dark mode", subtitle="Day look when Caelestia is light, Night look when it is dark")
+        sw.set_active(auto); sw.connect("notify::active", self.on_auto); sync.add(sw); self.pages["colour"].append(sync)
+        self.build_keys(keys); self.build_look()
+
+    def on_auto(self, row, _p):
+        state = "on" if row.get_active() else "off"
+        threading.Thread(target=lambda: cli("auto", state), daemon=True).start()
+        self.say("Monitor will follow Caelestia light/dark" if state == "on" else "Automatic looks off")
+
+    def schedule(self, key, fn):
+        if key in self.timers: GLib.source_remove(self.timers[key])
+        def fire(): self.timers.pop(key, None); fn(); return False
+        self.timers[key] = GLib.timeout_add(350, fire)
+
+    def run_set(self, disp, feat, val):
+        def work(): rc, _, err = cli("set", feat, str(val), "--display", str(disp)); self.say("Done" if rc == 0 else err)
+        threading.Thread(target=work, daemon=True).start()
+
+    def on_slide(self, sc, disp, feat):
+        v = int(sc.get_value()); self.say("Changing...")
+        self.schedule((disp, feat), lambda: self.run_set(disp, feat, v))
+
+    def on_colour(self, row, _p, disp):
+        i = row.get_selected()
+        if i != Gtk.INVALID_LIST_POSITION: self.schedule((disp, "colour"), lambda: self.run_set(disp, "colour", COLOURS[i]))
+
+    def on_profile(self, _b, name):
+        self.say(f"Applying {name}...")
+        def work():
+            rc, _, err = cli("profile", "apply", name); self.say("Done" if rc == 0 else err); GLib.idle_add(self.load)
+        threading.Thread(target=work, daemon=True).start()
+
+
+class App(Adw.Application):
+    def __init__(self):
+        super().__init__(application_id="io.github.krvats.cdisplay")
+        self.theme = None
+        self.connect("activate", self.on_activate)
+
+    def on_activate(self, _a):
+        if self.theme is None: self.theme = Theme()
+        (self.props.active_window or Win(self)).present()
+
+
+if __name__ == "__main__":
+    sys.exit(App().run(sys.argv))

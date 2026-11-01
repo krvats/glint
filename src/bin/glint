@@ -1,0 +1,894 @@
+#!/usr/bin/env python3
+"""glint - your monitor, your colours, one tiny tool.
+Resolution, refresh rate, brightness, contrast and colour, themed like your rice.
+Percent values always mean: 0 = the monitor's real lowest, 100 = the monitor's real highest."""
+import argparse, glob, json, os, pathlib, re, shutil, subprocess, sys
+
+VERSION = "1.0.0"
+HYPRCTL = os.environ.get("GLINT_HYPRCTL", "hyprctl")
+HYPRDIR = pathlib.Path(os.environ.get("GLINT_HYPR_DIR", pathlib.Path(os.environ.get("XDG_CONFIG_HOME", pathlib.Path.home() / ".config")) / "hypr"))
+DDCUTIL = os.environ.get("GLINT_DDCUTIL", "ddcutil")
+HOME = pathlib.Path.home()
+XDG = pathlib.Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config"))
+CONFIG = XDG / "glint"
+HERE = pathlib.Path(__file__).resolve().parent
+SHARE = [pathlib.Path(p) for p in (os.environ.get("GLINT_SHARE", ""), HERE.parent / "share",
+                                    HOME / ".local/share/glint", "/usr/share/glint", "/usr/local/share/glint") if p]
+
+# Only standard MCCS codes: safe on every monitor. Input switching is left out on purpose
+# (it can blank your only screen).
+FEATURES = {"colour": 0x14, "brightness": 0x10, "contrast": 0x12, "red": 0x16, "green": 0x18, "blue": 0x1A}
+RANGE = ["brightness", "contrast", "red", "green", "blue"]
+COLOUR = {"srgb": 1, "native": 2, "4000k": 3, "5000k": 4, "6500k": 5, "7500k": 6,
+          "8200k": 7, "9300k": 8, "11500k": 10, "user": 11}
+COLOUR_REV = {v: k for k, v in COLOUR.items()}
+
+
+def ddc(*args, check=True):
+    try:
+        r = subprocess.run([DDCUTIL, *args], capture_output=True, text=True, timeout=30)
+    except FileNotFoundError:
+        sys.exit("ddcutil is not installed. Run: sudo pacman -S ddcutil")
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("the monitor did not answer (timeout)")
+    if check and r.returncode != 0:
+        text = (r.stdout + r.stderr).strip()
+        raise RuntimeError(text.splitlines()[-1] if text else "ddcutil failed")
+    return r.stdout
+
+
+def detect():
+    out = ddc("detect", "--brief", check=False)
+    mons = []
+    for block in re.split(r"\n(?=Display |Invalid display|Phantom display)", out):
+        m = re.match(r"Display (\d+)", block.strip())
+        if not m:
+            continue
+        mon = re.search(r"Monitor:\s*(.+)", block)
+        bus = re.search(r"/dev/i2c-(\d+)", block)
+        parts = (mon.group(1).strip().split(":") + ["", "", ""])[:3] if mon else ["", "", ""]
+        mons.append({"id": int(m.group(1)), "bus": bus.group(1) if bus else None,
+                     "mfg": parts[0], "model": parts[1] or "Monitor", "serial": parts[2]})
+    return mons
+
+
+def sel(mon):
+    return ["--bus", mon["bus"]] if mon["bus"] else ["--display", str(mon["id"])]
+
+
+def getvcp(mon, feat):
+    out = ddc(*sel(mon), "getvcp", f"{FEATURES[feat]:02X}", "--brief")
+    m = re.search(r"VCP\s+[0-9A-Fa-f]{2}\s+C\s+(\d+)\s+(\d+)", out)
+    if m:
+        return {"cur": int(m.group(1)), "max": int(m.group(2))}
+    m = re.search(r"VCP\s+[0-9A-Fa-f]{2}\s+SNC\s+x([0-9A-Fa-f]+)", out)
+    if m:
+        return {"cur": int(m.group(1), 16), "max": None}
+    raise RuntimeError(f"{feat} is not supported by this monitor")
+
+
+def setvcp(mon, feat, raw):
+    ddc(*sel(mon), "setvcp", f"{FEATURES[feat]:02X}", str(int(raw)))
+
+
+def target(mon, feat, text):
+    text = str(text).strip().lower()
+    if feat == "colour":
+        if text not in COLOUR:
+            raise ValueError("colour must be one of: " + ", ".join(COLOUR))
+        return COLOUR[text]
+    cur = getvcp(mon, feat)
+    mx = cur["max"] or 100
+    if text in ("min", "max"):
+        pct = 0 if text == "min" else 100
+    elif text[0] in "+-":
+        pct = round(cur["cur"] * 100 / mx) + int(text)
+    else:
+        pct = int(text.rstrip("%"))
+    pct = max(0, min(100, pct))
+    return round(pct * mx / 100)
+
+
+def snapshot(mon):
+    vals = {}
+    for feat in FEATURES:
+        try:
+            v = getvcp(mon, feat)
+        except Exception:
+            continue
+        if feat == "colour":
+            vals[feat] = {"cur": v["cur"], "name": COLOUR_REV.get(v["cur"], f"code {v['cur']}")}
+        else:
+            vals[feat] = {"cur": v["cur"], "max": v["max"], "percent": round(v["cur"] * 100 / (v["max"] or 100))}
+    return vals
+
+
+def chosen(a):
+    mons = detect()
+    if getattr(a, "display", None):
+        mons = [m for m in mons if m["id"] == a.display]
+    if not mons:
+        sys.exit("No monitor found. Run: glint doctor")
+    return mons
+
+
+def name(m):
+    return f"{m['mfg']} {m['model']}".strip()
+
+
+def cmd_list(a):
+    mons = detect()
+    if a.json:
+        print(json.dumps(mons)); return 0
+    for m in mons:
+        print(f"{m['id']}: {name(m)} (i2c-{m['bus']})")
+    return 0 if mons else 1
+
+
+def cmd_get(a):
+    data = []
+    for m in chosen(a):
+        vals = snapshot(m)
+        if a.feature:
+            vals = {k: v for k, v in vals.items() if k == a.feature}
+        data.append({"id": m["id"], "name": name(m), "values": vals})
+    if a.json:
+        print(json.dumps({"displays": data})); return 0
+    for d in data:
+        print(f"{d['id']}: {d['name']}")
+        for k, v in d["values"].items():
+            print(f"   {k:11} " + (v["name"] if k == "colour" else f"{v['percent']}%  (raw {v['cur']}/{v['max']})"))
+    return 0
+
+
+def cmd_set(a):
+    rc = 0
+    for m in chosen(a):
+        try:
+            setvcp(m, a.feature, target(m, a.feature, a.value))
+            print(f"{name(m)}: {a.feature} set")
+        except Exception as e:
+            print(f"{name(m)}: {e}", file=sys.stderr); rc = 1
+    return rc
+
+
+def load_profiles():
+    out = {}
+    for d in [s / "profiles" for s in SHARE] + [CONFIG / "profiles"]:
+        for f in sorted(glob.glob(str(d / "*.json"))):
+            try:
+                out[pathlib.Path(f).stem] = json.load(open(f))
+            except Exception:
+                pass
+    return out
+
+
+def cmd_profile(a):
+    profs = load_profiles()
+    if a.action == "list":
+        if a.json: print(json.dumps(sorted(profs)))
+        else: print("\n".join(sorted(profs)))
+        return 0
+    if not a.name:
+        sys.exit("Give a profile name.")
+    if a.action == "save":
+        m = chosen(a)[0]
+        vals = snapshot(m)
+        settings = {k: (v["name"] if k == "colour" else str(v["percent"])) for k, v in vals.items()
+                    if not (k == "colour" and v["name"].startswith("code"))}
+        d = CONFIG / "profiles"; d.mkdir(parents=True, exist_ok=True)
+        json.dump({"settings": settings}, open(d / f"{a.name}.json", "w"), indent=2)
+        print(f"Saved profile '{a.name}' from {name(m)}"); return 0
+    if a.name not in profs:
+        sys.exit("Unknown profile. Available: " + ", ".join(sorted(profs)))
+    settings = dict(sorted(profs[a.name]["settings"].items(), key=lambda kv: kv[0] != "colour"))
+    rc = 0
+    for m in chosen(a):
+        for feat, val in settings.items():
+            try:
+                setvcp(m, feat, target(m, feat, val))
+            except Exception as e:
+                print(f"{name(m)}: {feat}: {e}", file=sys.stderr); rc = 1
+        print(f"{name(m)}: profile '{a.name}' applied")
+    return rc
+
+
+def cmd_caps(a):
+    for m in chosen(a):
+        print(f"=== {name(m)} ===")
+        print(ddc(*sel(m), "capabilities", check=False))
+    return 0
+
+
+def cmd_doctor(a):
+    print(f"glint {VERSION} doctor\n")
+    if not shutil.which(DDCUTIL):
+        print("[X] ddcutil missing. Install it (pacman -S / apt install / dnf install ddcutil) and run glint doctor again"); return 1
+    print("[OK] ddcutil found")
+    buses = glob.glob("/dev/i2c-*")
+    if not buses:
+        print("[X] no /dev/i2c-* devices -> run: sudo modprobe i2c-dev   (the installer makes this permanent)")
+    elif not any(os.access(b, os.R_OK | os.W_OK) for b in buses):
+        print("[X] no permission on /dev/i2c-* -> log out and back in once (or reboot)")
+    else:
+        print("[OK] i2c access")
+    p = palette()
+    print(f"[OK] theme: following {p['_source']} ({p['_name']}, {p['_mode']})" if p else "[--] theme: no Caelestia/pywal colours found, using your GTK theme")
+    print(f"[OK] app sync: {'on' if (SYSD / 'glint-sync.path').exists() else 'off  (enable with: glint sync on)'}")
+    try:
+        print(f"[OK] screen: {', '.join(o['name'] + ' ' + str(o['width']) + 'x' + str(o['height']) + '@' + str(o['refresh']) for o in outputs())}")
+    except Exception as e:
+        print(f"[--] screen: {e}")
+    mons = detect()
+    if not mons:
+        print("[X] no monitor answered brightness/colour (DDC/CI). Some monitors have a DDC/CI switch in their menu. NVIDIA users: see the README.")
+        return 1
+    for m in mons:
+        print(f"\n[OK] {m['id']}: {name(m)} (i2c-{m['bus']})")
+        for k, v in snapshot(m).items():
+            print(f"      {k:11} " + (v["name"] if k == "colour" else f"{v['percent']}%   raw {v['cur']} of max {v['max']}"))
+        for d in [s / "monitors" for s in SHARE]:
+            for f in glob.glob(str(d / "*.json")):
+                info = json.load(open(f))
+                if info["match"].lower() in m["model"].lower():
+                    print("      tips for this monitor:")
+                    for n in info["notes"]: print("       -", n)
+    print("\nTo test Caelestia's slider: drag it to the lowest, run `glint get`, drag to the highest, run it again.")
+    print("The raw numbers show exactly what Caelestia sends to the monitor.")
+    return 0
+
+
+AUTO = CONFIG / "auto-profile"
+LAST = CONFIG / "last-mode"
+
+
+def cmd_auto(a):
+    if a.state == "on":
+        CONFIG.mkdir(parents=True, exist_ok=True); AUTO.touch()
+        print("ON: the monitor switches to the Day look in light mode and the Night look in dark mode.")
+    elif a.state == "off":
+        AUTO.unlink(missing_ok=True); print("OFF: the monitor is left alone when the theme changes.")
+    else:
+        print("on" if AUTO.exists() else "off")
+    return 0
+
+
+def cmd_syncmode(a):
+    """Called by caelestia-theme-sync. Acts only when auto is ON and the mode really changed."""
+    if not AUTO.exists():
+        return 0
+    if LAST.exists() and LAST.read_text().strip() == a.mode:
+        return 0
+    CONFIG.mkdir(parents=True, exist_ok=True); LAST.write_text(a.mode)
+    a.action, a.name = "apply", ("day" if a.mode == "light" else "night")
+    return cmd_profile(a)
+
+
+# ---------- screen layout: resolution, refresh rate, scale, position, rotation (Hyprland) ----------
+SCREENS = CONFIG / "screens.json"
+MARK = "-- glint monitors (managed by Glint)"
+MARK_CONF = "# glint monitors (managed by Glint)"
+
+
+def hypr(*args, check=True):
+    try:
+        r = subprocess.run([HYPRCTL, *args], capture_output=True, text=True, timeout=15)
+    except FileNotFoundError:
+        raise RuntimeError("Screen settings currently support Hyprland (hyprctl not found).")
+    if check and r.returncode != 0:
+        raise RuntimeError((r.stdout + r.stderr).strip() or "hyprctl failed")
+    return r.stdout
+
+
+def outputs():
+    out = []
+    for m in json.loads(hypr("monitors", "-j")):
+        modes = {}
+        for t in m.get("availableModes", []):
+            mm = re.match(r"(\d+)x(\d+)@([\d.]+)Hz", t)
+            if mm:
+                modes.setdefault(f"{mm.group(1)}x{mm.group(2)}", []).append(mm.group(3))
+        out.append({"name": m["name"], "label": (m.get("description") or m["name"]),
+                    "width": m["width"], "height": m["height"], "refresh": round(m["refreshRate"], 2),
+                    "x": m["x"], "y": m["y"], "scale": m["scale"], "transform": m.get("transform", 0),
+                    "modes": modes})
+    return out
+
+
+def pick_refresh(mode_list, want):
+    """Return the exact refresh string the monitor offers that is closest to what was asked (144 -> 143.98)."""
+    if not mode_list:
+        raise ValueError("that resolution is not offered by the monitor")
+    if want in (None, "", "auto", "best"):
+        return max(mode_list, key=float)
+    w = float(want)
+    best = min(mode_list, key=lambda r: abs(float(r) - w))
+    if abs(float(best) - w) > 1.5:
+        raise ValueError("refresh rate not available at that resolution. Available: " + ", ".join(sorted(mode_list, key=float)))
+    return best
+
+
+def mode_str(res, hz):
+    return f"{res}@{hz}"
+
+
+def apply_live(name, mode, pos, scale, transform):
+    spec = f"{name},{mode},{pos},{scale},transform,{transform}"
+    try:
+        r = hypr("keyword", "monitor", spec, check=False)
+        if r.strip().lower().startswith("ok") or r.strip() == "":
+            return
+    except RuntimeError:
+        pass
+    lua = f'hl.monitor({{output="{name}", mode="{mode}", position="{pos}", scale={scale}, transform={transform}}})'
+    hypr("eval", lua)
+
+
+def write_files(state):
+    CONFIG.mkdir(parents=True, exist_ok=True)
+    lua, conf = ["-- generated by Glint, do not edit by hand"], ["# generated by Glint, do not edit by hand"]
+    for n, v in state.items():
+        lua.append(f'hl.monitor({{ output = "{n}", mode = "{v["mode"]}", position = "{v["pos"]}", '
+                   f'scale = {v["scale"]}, transform = {v["transform"]} }})')
+        conf.append(f'monitor = {n},{v["mode"]},{v["pos"]},{v["scale"]},transform,{v["transform"]}')
+    kl, kc = key_lines()
+    (CONFIG / "monitors.lua").write_text("\n".join(lua + kl) + "\n")
+    (CONFIG / "monitors.conf").write_text("\n".join(conf + kc) + "\n")
+
+
+def install_hook():
+    """Make Hyprland load our monitor file LAST, so it overrides older monitor lines. Backs up first, adds once."""
+    lua, conf = HYPRDIR / "hyprland.lua", HYPRDIR / "hyprland.conf"
+    if lua.exists():
+        f, mark = lua, MARK
+        line = f'pcall(dofile, (os.getenv("XDG_CONFIG_HOME") or (os.getenv("HOME") .. "/.config")) .. "/glint/monitors.lua")'
+    elif conf.exists():
+        f, mark = conf, MARK_CONF
+        line = "source = ~/.config/glint/monitors.conf"
+    else:
+        raise RuntimeError(f"no hyprland.lua or hyprland.conf found in {HYPRDIR}")
+    text = f.read_text()
+    if mark in text:
+        return str(f)
+    if re.search(r"(cdisplay|glint) monitors", text):   # an older install: swap its lines for ours
+        unhook(); text = f.read_text()
+    shutil.copy2(f, str(f) + ".glint.bak")
+    f.write_text(text.rstrip("\n") + f"\n\n{mark}\n{line}\n")
+    return str(f)
+
+
+def cmd_screen(a):
+    outs = outputs()
+    if a.action == "list":
+        if a.json:
+            print(json.dumps({"outputs": outs})); return 0
+        for o in outs:
+            print(f"{o['name']}: {o['label']}\n   now {o['width']}x{o['height']}@{o['refresh']} scale {o['scale']} "
+                  f"at {o['x']}x{o['y']} rotation {o['transform']}")
+            print("   modes: " + ", ".join(f"{r}: {'/'.join(sorted(h, key=float, reverse=True))}" for r, h in o["modes"].items()))
+        return 0
+    if a.action == "persist":
+        print("Saved to " + install_hook()); return 0
+    o = next((x for x in outs if x["name"] == a.output), None)
+    if not o:
+        raise RuntimeError("unknown output. Available: " + ", ".join(x["name"] for x in outs))
+    if a.action == "set":
+        res = a.resolution or f"{o['width']}x{o['height']}"
+        if res not in o["modes"]:
+            raise RuntimeError("resolution not offered. Available: " + ", ".join(o["modes"]))
+        want = a.refresh if a.refresh is not None else (o["refresh"] if res == f"{o['width']}x{o['height']}" else "best")
+        hz = pick_refresh(o["modes"][res], want)
+        scale = a.scale if a.scale is not None else o["scale"]
+        if not 0.25 <= float(scale) <= 4:
+            raise RuntimeError("scale must be between 0.25 and 4")
+        tr = a.rotate if a.rotate is not None else o["transform"]
+        pos = a.position or f"{o['x']}x{o['y']}"
+        if not re.fullmatch(r"-?\d+x-?\d+|auto", pos):
+            raise RuntimeError("position must look like 0x0, 2560x0 or auto")
+        prev = SCREENS_prev(o)
+        apply_live(o["name"], mode_str(res, hz), pos, scale, tr)
+        if not a.no_save:
+            state = json.load(open(SCREENS)) if SCREENS.exists() else {}
+            state[o["name"]] = {"mode": mode_str(res, hz), "pos": pos, "scale": scale, "transform": tr}
+            CONFIG.mkdir(parents=True, exist_ok=True); json.dump(state, open(SCREENS, "w"), indent=2)
+            write_files(state); install_hook()
+        print(f"{o['name']}: {res}@{hz}, scale {scale}, rotation {tr}, position {pos}" + (" (not saved)" if a.no_save else " (saved)"))
+        return 0
+    if a.action == "revert":
+        apply_live(o["name"], a.to, f"{o['x']}x{o['y']}", o["scale"], o["transform"]); print("reverted"); return 0
+    return 1
+
+
+def SCREENS_prev(o):
+    return mode_str(f"{o['width']}x{o['height']}", o["refresh"])
+
+
+# ---------- shortcuts: Super+Alt+..., checked against your existing binds so nothing collides ----------
+KEYS = CONFIG / "keys.json"
+ACTIONS = {  # name: (default combo, command, label)
+    "open":            ("SUPER ALT, M",    "glint-gui",                  "Open Glint"),
+    "brightness_up":   ("SUPER ALT, Up",   "glint step brightness +10",  "Brightness up"),
+    "brightness_down": ("SUPER ALT, Down", "glint step brightness -10",  "Brightness down"),
+    "night":           ("SUPER ALT, N",    "glint profile apply night",  "Night look"),
+    "day":             ("SUPER ALT, D",    "glint profile apply day",    "Day look"),
+    "gaming":          ("SUPER ALT, G",    "glint profile apply gaming", "Gaming look"),
+}
+MODS = {"shift": 1, "ctrl": 4, "alt": 8, "super": 64}
+ALIAS = {"control": "ctrl", "mod": "super", "win": "super", "meta": "super", "windows": "super", "mod4": "super", "mod1": "alt"}
+
+
+def parse_combo(text):
+    parts = [t for t in re.split(r"[\s+,]+", str(text).strip()) if t]
+    if not parts:
+        raise ValueError("empty shortcut")
+    mods = []
+    for t in parts[:-1]:
+        t = ALIAS.get(t.lower(), t.lower())
+        if t not in MODS:
+            raise ValueError(f"unknown modifier '{t}' (use SUPER, ALT, CTRL, SHIFT)")
+        if t not in mods:
+            mods.append(t)
+    if not mods:
+        raise ValueError("add at least one modifier, e.g. SUPER ALT, M")
+    return mods, parts[-1]
+
+
+def combo_id(text):
+    mods, key = parse_combo(text)
+    return sum(MODS[m] for m in mods), key.lower()
+
+
+def load_keys():
+    d = json.load(open(KEYS)) if KEYS.exists() else {}
+    d.setdefault("enabled", True); d.setdefault("binds", {}); d.setdefault("owned", [])
+    return d
+
+
+def foreign_binds(owned):
+    try:
+        data = json.loads(hypr("binds", "-j"))
+    except Exception:
+        return {}
+    out = {}
+    for b in data:
+        ident = (int(b.get("modmask", 0)) & 0x4D, str(b.get("key", "")).lower())
+        if f"{ident[0]}:{ident[1]}" in owned or "glint" in json.dumps(b).lower():
+            continue
+        out[ident] = (b.get("description") or b.get("arg") or b.get("dispatcher") or "another bind")
+    return out
+
+
+def bind_plan():
+    """Returns (binds to write, skipped because taken). A combo already used by another tool is never touched."""
+    k = load_keys()
+    taken = foreign_binds(set(k["owned"]))
+    use, skip = [], []
+    for name, (dcombo, cmd, label) in ACTIONS.items():
+        combo = k["binds"].get(name, dcombo)
+        if not combo or not k["enabled"]:
+            continue
+        ident = combo_id(combo)
+        (skip if ident in taken else use).append((name, combo, cmd, label, taken.get(ident)))
+    return use, skip
+
+
+def key_lines():
+    use, _ = bind_plan()
+    lua, conf = [], []
+    for name, combo, cmd, label, _ in use:
+        mods, key = parse_combo(combo)
+        lua.append(f'hl.bind("{" + ".join(m.upper() for m in mods)} + {key}", hl.dsp.exec_cmd("{cmd}"))')
+        conf.append(f'bind = {" ".join(m.upper() for m in mods)}, {key}, exec, {cmd}')
+    k = load_keys()
+    k["owned"] = [f"{m}:{kk}" for m, kk in (combo_id(u[1]) for u in use)]
+    CONFIG.mkdir(parents=True, exist_ok=True); json.dump(k, open(KEYS, "w"), indent=2)
+    return lua, conf
+
+
+def cmd_keys(a):
+    k = load_keys()
+    if a.action == "list":
+        use, skip = bind_plan()
+        rows = []
+        for name, (dcombo, cmd, label) in ACTIONS.items():
+            combo = k["binds"].get(name, dcombo)
+            st = "on" if any(u[0] == name for u in use) else ("TAKEN by " + str(next(s[4] for s in skip if s[0] == name)) if any(s[0] == name for s in skip) else "off")
+            rows.append({"name": name, "combo": combo, "label": label, "status": st})
+        if a.json:
+            print(json.dumps({"enabled": k["enabled"], "keys": rows})); return 0
+        for r in rows:
+            print(f"{r['name']:16} {r['combo'] or '(none)':16} {r['label']}  [{r['status']}]")
+        return 0
+    if a.action in ("on", "off"):
+        k["enabled"] = a.action == "on"; json.dump(k, open(KEYS, "w"), indent=2)
+    elif a.action == "set":
+        if a.name not in ACTIONS:
+            raise RuntimeError("unknown action. Available: " + ", ".join(ACTIONS))
+        if a.combo and a.combo.lower() != "none":
+            clash = foreign_binds(set(k["owned"])).get(combo_id(a.combo))
+            if clash:
+                raise RuntimeError(f"{a.combo} is already used by another bind ({clash}). Pick a different one.")
+            k["binds"][a.name] = a.combo
+        else:
+            k["binds"][a.name] = ""
+        json.dump(k, open(KEYS, "w"), indent=2)
+    elif a.action == "reset":
+        k["binds"] = {}; json.dump(k, open(KEYS, "w"), indent=2)
+    state = json.load(open(SCREENS)) if SCREENS.exists() else {}
+    write_files(state); install_hook()
+    hypr("reload", check=False)
+    _, skip = bind_plan()
+    for s in skip:
+        print(f"skipped {s[0]}: {s[1]} is already used by {s[4]}", file=sys.stderr)
+    print("shortcuts updated")
+    return 0
+
+
+# ---------- theme: ONE palette for the app, the shell look and the whole-system sync ----------
+SCHEME = HOME / ".local/state/caelestia/scheme.json"
+WAL = HOME / ".cache/wal/colors.json"
+GTKCSS = XDG / "gtk-4.0/gtk.css"
+THEMEF = CONFIG / "theme.json"
+SOURCES = ["auto", "caelestia", "pywal", "gtk", "system"]
+
+
+def _rgb(h):
+    h = h.lstrip("#"); return [int(h[i:i + 2], 16) for i in (0, 2, 4)]
+
+
+def _hex(c):
+    return "#%02x%02x%02x" % tuple(max(0, min(255, round(x))) for x in c)
+
+
+def mix(a, b, t):
+    return _hex([x + (y - x) * t for x, y in zip(_rgb(a), _rgb(b))])
+
+
+def lum(h):
+    r, g, b = _rgb(h); return (0.299 * r + 0.587 * g + 0.114 * b) / 255
+
+
+def theme_cfg():
+    try:
+        return json.load(open(THEMEF))
+    except Exception:
+        return {}
+
+
+def mk(bg, fg, accent, accentfg=None, **o):
+    """Build a full palette from a few colours; anything a source does not provide is derived."""
+    p = {"bg": bg, "fg": fg, "view": mix(bg, fg, .03), "header": mix(bg, fg, .06), "card": mix(bg, fg, .10),
+         "bright": mix(bg, fg, .14), "lowest": mix(bg, "#000000", .35), "outline": mix(bg, fg, .40), "muted": mix(bg, fg, .72),
+         "accent": accent, "accentfg": accentfg or ("#000000" if lum(accent) > .55 else "#ffffff"),
+         "secondary": accent, "tertiary": accent, "error": "#ba1a1a", "onerror": "#ffffff"}
+    p.update({k: v for k, v in o.items() if v})
+    return p
+
+
+def read_caelestia():
+    d = json.load(open(SCHEME))
+    c = {k.lower().replace("_", ""): "#" + str(v).lstrip("#") for k, v in (d.get("colours") or d.get("colors") or {}).items()}
+    g = lambda *n: next((c[x] for x in n if x in c), None)
+    bg, fg, ac = g("surface", "background"), g("onsurface", "onbackground"), g("primary")
+    if not (bg and fg and ac):
+        raise ValueError("scheme.json has no surface/onSurface/primary colours")
+    p = mk(bg, fg, ac, g("onprimary"), view=g("surfacecontainerlow"), header=g("surfacecontainer"), card=g("surfacecontainerhigh"),
+           bright=g("surfacebright"), lowest=g("surfacecontainerlowest"), outline=g("outline"), muted=g("onsurfacevariant"),
+           secondary=g("secondary"), tertiary=g("tertiary"), error=g("error"), onerror=g("onerror"))
+    p["_source"], p["_name"] = "caelestia", " ".join(str(d[k]) for k in ("name", "flavour", "variant") if d.get(k))
+    return p
+
+
+def read_wal():
+    d = json.load(open(WAL)); sp, co = d["special"], d["colors"]
+    p = mk(sp["background"], sp["foreground"], co.get("color4", sp["foreground"]), secondary=co.get("color6"),
+           tertiary=co.get("color5"), error=co.get("color1"))
+    p["_source"], p["_name"] = "pywal", "wal colours"
+    return p
+
+
+def read_gtk():
+    t = GTKCSS.read_text()
+    c = {m.group(1): m.group(2) for m in re.finditer(r"@define-color\s+(\w+)\s+(#[0-9a-fA-F]{6})\s*;", t)}
+    if not all(k in c for k in ("window_bg_color", "window_fg_color", "accent_bg_color")):
+        raise ValueError("gtk.css has no colours")
+    p = mk(c["window_bg_color"], c["window_fg_color"], c["accent_bg_color"], c.get("accent_fg_color"),
+           view=c.get("view_bg_color"), header=c.get("headerbar_bg_color"), card=c.get("card_bg_color"))
+    p["_source"], p["_name"] = "gtk", "your gtk.css"
+    return p
+
+
+def palette(cfg=None):
+    """The colours to wear, or None to just use the system theme."""
+    cfg = theme_cfg() if cfg is None else cfg
+    src = cfg.get("source", "auto")
+    readers = {"auto": [read_caelestia, read_wal, read_gtk], "caelestia": [read_caelestia], "pywal": [read_wal], "gtk": [read_gtk]}.get(src, [])
+    p = None
+    for f in readers:
+        try:
+            p = f(); break
+        except Exception:
+            continue
+    if not p:
+        return None
+    if cfg.get("accent"):
+        p["accent"] = cfg["accent"]; p["accentfg"] = "#000000" if lum(cfg["accent"]) > .55 else "#ffffff"
+    p.update({k: v for k, v in (cfg.get("colors") or {}).items() if k in p and not k.startswith("_")})
+    p["_mode"] = "dark" if lum(p["bg"]) < .5 else "light"
+    return p
+
+
+def cmd_theme(a):
+    cfg = theme_cfg()
+    if a.action == "set":
+        k, v = a.key, a.value
+        if k == "source" and v in SOURCES: cfg[k] = v
+        elif k == "radius" and v and v.isdigit() and int(v) <= 32: cfg[k] = int(v)
+        elif k == "glass" and v and re.fullmatch(r"[0-9.]+", v) and 0.3 <= float(v) <= 1: cfg[k] = float(v)
+        elif k == "accent" and v == "reset": cfg.pop("accent", None)
+        elif k == "accent" and v and re.fullmatch(r"#[0-9a-fA-F]{6}", v): cfg[k] = v.lower()
+        else:
+            raise RuntimeError("usage: glint theme set source auto|caelestia|pywal|gtk|system | radius 0-32 | glass 0.3-1 | accent #rrggbb|reset")
+        CONFIG.mkdir(parents=True, exist_ok=True); json.dump(cfg, open(THEMEF, "w"), indent=2)
+    p = palette(cfg)
+    out = {"source": p["_source"] if p else "system", "name": p["_name"] if p else "your system theme", "mode": p["_mode"] if p else "auto",
+           "radius": cfg.get("radius", 18), "glass": cfg.get("glass", 1.0),
+           "palette": {k: v for k, v in p.items() if not k.startswith("_")} if p else None}
+    if a.json:
+        print(json.dumps(out)); return 0
+    print(f"Following: {out['source']} ({out['name']}, {out['mode']})")
+    if p:
+        sw = "".join("\x1b[48;2;%d;%d;%dm    \x1b[0m " % tuple(_rgb(p[k])) for k in ("bg", "card", "accent", "secondary", "tertiary", "fg"))
+        print(sw if sys.stdout.isatty() else "  ".join(f"{k} {p[k]}" for k in ("bg", "accent", "fg")))
+    else:
+        print("No Caelestia/pywal/gtk.css colours found, so Glint uses your GTK/libadwaita theme.")
+    print(f"Settings: {THEMEF}  (source, radius, glass, accent, colours)")
+    return 0
+
+
+# ---------- sync: make the rest of the desktop wear the same colours ----------
+SYSD = XDG / "systemd/user"
+GEN = "/* generated by glint: `glint sync off` brings your old file back */"
+
+
+def sh(*args):
+    try:
+        subprocess.run(args, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20)
+    except Exception:
+        pass
+
+
+def sync_apps(p):
+    dark = p["_mode"] == "dark"
+    sh("gsettings", "set", "org.gnome.desktop.interface", "color-scheme", "prefer-dark" if dark else "prefer-light")
+    if any((d / "adw-gtk3").exists() for d in (pathlib.Path("/usr/share/themes"), HOME / ".local/share/themes", HOME / ".themes")):
+        sh("gsettings", "set", "org.gnome.desktop.interface", "gtk-theme", "adw-gtk3-dark" if dark else "adw-gtk3")
+    pairs = {"accent_bg_color": p["accent"], "accent_fg_color": p["accentfg"], "accent_color": p["accent"],
+             "window_bg_color": p["bg"], "window_fg_color": p["fg"], "view_bg_color": p["view"], "view_fg_color": p["fg"],
+             "headerbar_bg_color": p["header"], "headerbar_fg_color": p["fg"], "card_bg_color": p["card"], "card_fg_color": p["fg"],
+             "popover_bg_color": p["card"], "popover_fg_color": p["fg"], "sidebar_bg_color": p["header"], "sidebar_fg_color": p["fg"],
+             "dialog_bg_color": p["card"], "dialog_fg_color": p["fg"], "destructive_bg_color": p["error"], "destructive_fg_color": p["onerror"]}
+    css = GEN + "\n" + "".join(f"@define-color {k} {v};\n" for k, v in pairs.items())
+    for d in ("gtk-3.0", "gtk-4.0"):
+        f = XDG / d / "gtk.css"; f.parent.mkdir(parents=True, exist_ok=True)
+        if f.exists() and GEN not in f.read_text() and not (f.parent / "gtk.css.glint-bak").exists():
+            shutil.copy2(f, f.parent / "gtk.css.glint-bak")
+        f.write_text(css)
+    line = ", ".join("#ff" + x.lstrip("#") for x in [p["fg"], p["card"], p["bright"], p["bright"], p["lowest"], p["outline"], p["fg"], p["fg"], p["fg"],
+                     p["view"], p["bg"], "#000000", p["accent"], p["accentfg"], p["tertiary"], p["secondary"], p["header"], p["bg"], p["card"], p["fg"], p["muted"]])
+    for q in ("qt6ct", "qt5ct"):
+        if not (shutil.which(q) or (XDG / q).exists()):
+            continue
+        cf = XDG / q / "colors" / "glint.conf"; cf.parent.mkdir(parents=True, exist_ok=True)
+        cf.write_text(f"[ColorScheme]\nactive_colors={line}\ndisabled_colors={line}\ninactive_colors={line}\n")
+        ini = XDG / q / f"{q}.conf"
+        import configparser
+        cp = configparser.ConfigParser(interpolation=None); cp.optionxform = str
+        if ini.exists(): cp.read(ini)
+        if not cp.has_section("Appearance"): cp.add_section("Appearance")
+        cp["Appearance"].update({"custom_palette": "true", "color_scheme_path": str(cf), "style": "Fusion"})
+        with open(ini, "w") as fh: cp.write(fh, space_around_delimiters=False)
+    if p["_source"] == "caelestia":   # a pywal-style file so wal-aware tools (pywalfox, spicetify...) follow Caelestia too
+        dk, lt = sorted([p["bg"], p["fg"]], key=lum)
+        ansi = [dk, p["error"], p["tertiary"], p["secondary"], p["accent"], p["tertiary"], p["secondary"], lt]
+        WAL.parent.mkdir(parents=True, exist_ok=True)
+        WAL.write_text(json.dumps({"wallpaper": "", "alpha": "100", "special": {"background": dk, "foreground": lt, "cursor": lt},
+                                   "colors": {f"color{i}": ansi[i % 8] for i in range(16)}}, indent=2))
+    if shutil.which("pywalfox"):
+        sh("pywalfox", "dark" if dark else "light"); sh("pywalfox", "update")
+    try:
+        cmd_syncmode(argparse.Namespace(mode="dark" if dark else "light", display=None, json=False))
+    except Exception:
+        pass
+
+
+def cmd_sync(a):
+    ENV = XDG / "environment.d/60-glint-qt.conf"
+    if a.action in ("now", "on"):
+        p = palette()
+        if not p or p["_source"] == "gtk":
+            print("Nothing to sync: no Caelestia or pywal colours found."); return 0 if a.action == "now" else 1
+        if a.action == "on":
+            SYSD.mkdir(parents=True, exist_ok=True)
+            exe = str(pathlib.Path(sys.argv[0]).resolve())
+            (SYSD / "glint-sync.path").write_text(f"[Unit]\nDescription=Glint: watch your theme\n[Path]\nPathChanged={SCHEME}\nPathChanged={WAL}\n"
+                                                  "Unit=glint-sync.service\n[Install]\nWantedBy=default.target\n")
+            (SYSD / "glint-sync.service").write_text(f"[Unit]\nDescription=Glint: sync apps with your theme\n[Service]\nType=oneshot\nExecStart={exe} sync now\n")
+            sh("systemctl", "--user", "daemon-reload"); sh("systemctl", "--user", "enable", "--now", "glint-sync.path")
+            if shutil.which("qt6ct") or shutil.which("qt5ct"):
+                ENV.parent.mkdir(parents=True, exist_ok=True); ENV.write_text("QT_QPA_PLATFORMTHEME=qt6ct\n")
+            if shutil.which("flatpak"):
+                sh("flatpak", "override", "--user", "--filesystem=xdg-config/gtk-3.0:ro", "--filesystem=xdg-config/gtk-4.0:ro",
+                   "--filesystem=xdg-config/qt6ct:ro", "--filesystem=xdg-config/qt5ct:ro")
+        sync_apps(p)
+        print(f"Synced GTK, Qt and wal-aware apps to {p['_source']} ({p['_mode']})." + ("  Auto-sync is on." if a.action == "on" else ""))
+        return 0
+    if a.action == "off":
+        sh("systemctl", "--user", "disable", "--now", "glint-sync.path")
+        for n in ("glint-sync.path", "glint-sync.service"): (SYSD / n).unlink(missing_ok=True)
+        ENV.unlink(missing_ok=True)
+        for d in ("gtk-3.0", "gtk-4.0"):
+            f, bak = XDG / d / "gtk.css", XDG / d / "gtk.css.glint-bak"
+            if f.exists() and GEN in f.read_text():
+                if bak.exists(): shutil.move(str(bak), str(f))
+                else: f.unlink()
+        print("Auto-sync off. Your old GTK css was put back."); return 0
+    on = (SYSD / "glint-sync.path").exists()
+    print("on" if on else "off"); return 0
+
+
+# ---------- upgrade from the old name, and clean uninstall ----------
+def unhook():
+    for f in (HYPRDIR / "hyprland.lua", HYPRDIR / "hyprland.conf"):
+        if not f.exists():
+            continue
+        lines, out, skip = f.read_text().split("\n"), [], False
+        for ln in lines:
+            if skip:
+                skip = False; continue
+            if re.search(r"(cdisplay|glint) monitors \(managed", ln):
+                skip = True; continue
+            out.append(ln)
+        f.write_text(re.sub(r"\n{3,}$", "\n", "\n".join(out)))
+
+
+def cmd_migrate(a):
+    old = XDG / "cdisplay"
+    if old.exists() and not CONFIG.exists():
+        old.rename(CONFIG)
+    state = json.load(open(SCREENS)) if SCREENS.exists() else {}
+    if CONFIG.exists() and (CONFIG / "monitors.lua").exists():
+        write_files(state); install_hook()
+    oldp = SYSD / "caelestia-theme-sync.path"
+    if oldp.exists():
+        sh("systemctl", "--user", "disable", "--now", "caelestia-theme-sync.path")
+        for n in ("caelestia-theme-sync.path", "caelestia-theme-sync.service"): (SYSD / n).unlink(missing_ok=True)
+        (HOME / ".local/bin/caelestia-theme-sync").unlink(missing_ok=True)
+    print("migrated"); return 0
+
+
+def cmd_uninstall(a):
+    unhook(); cmd_sync(argparse.Namespace(action="off"))
+    sh(HYPRCTL, "reload")
+    if a.purge:
+        shutil.rmtree(CONFIG, ignore_errors=True)
+    print("Hyprland lines and theme sync removed." + ("" if a.purge else f" Your settings stay in {CONFIG} (use --purge to delete)."))
+    return 0
+
+
+def cmd_report(a):
+    """One shareable file for bug reports and new-monitor support. Serial numbers are removed."""
+    out = HOME / "glint-report.txt"
+    parts = [f"glint {VERSION}"]
+    for m in chosen(a):
+        parts += [f"== {name(m)} ==", ddc(*sel(m), "capabilities", check=False), ddc(*sel(m), "getvcp", "all", check=False)]
+    text = re.sub(r"(?im)^.*serial.*$", "[serial removed]", "\n".join(parts))
+    out.write_text(text)
+    print(f"Saved {out}\nAttach that one file to your GitHub issue (it contains no serial numbers).")
+    return 0
+
+
+LOCK_CMD = ["qs", "-c", "caelestia", "ipc", "call", "lock", "lock"]
+LOGOUT_DEFAULT = ["loginctl", "terminate-user", ""]
+
+
+def hypridle_files():
+    home = HOME
+    found = [p for p in (home / ".config/hypr/hypridle.conf", home / ".config/caelestia/hypridle.conf") if p.exists()]
+    found += [p for p in (home / ".config/hypr").glob("**/hypridle*.conf") if p not in found]
+    return found
+
+
+def cmd_lock(a):
+    """Opt-in. on: power-panel top button locks with the Caelestia lock screen and nothing locks by itself
+    on sleep/wake/idle. off: put everything back from the backups."""
+    home = HOME
+    sj = home / ".config/caelestia/shell.json"
+    if a.state == "on":
+        if sj.exists():
+            try:
+                data = json.load(open(sj))
+            except Exception as e:
+                print(f"shell.json is not plain JSON ({e}); not touched. Set session.commands.logout to {json.dumps(LOCK_CMD)} yourself.")
+            else:
+                if not pathlib.Path(str(sj) + ".glint-bak").exists():
+                    shutil.copy(sj, str(sj) + ".glint-bak")
+                data.setdefault("session", {}).setdefault("commands", {})["logout"] = LOCK_CMD
+                json.dump(data, open(sj, "w"), indent=2)
+                print("Power panel: the top button now locks the screen.")
+        else:
+            print("shell.json not found: power-panel button not changed (Caelestia has not created it yet).")
+        for f in hypridle_files():
+            if not pathlib.Path(str(f) + ".glint-bak").exists():
+                shutil.copy(f, str(f) + ".glint-bak")
+            out = []
+            for ln in f.read_text().splitlines():
+                key = ln.split("=")[0].strip()
+                val = ln.split("=", 1)[1] if "=" in ln else ""
+                if key == "lock_cmd":
+                    ln = "    lock_cmd = " + " ".join(LOCK_CMD)
+                elif key in ("on-timeout", "before_sleep_cmd", "after_sleep_cmd") and "lock" in val and "unlock" not in val:
+                    ln = ln.split("=")[0] + "= true"           # harmless no-op, keeps the file valid
+                out.append(ln)
+            f.write_text("\n".join(out) + "\n")
+            print(f"Auto-lock removed in {f} (backup saved).")
+        if not hypridle_files():
+            print("No hypridle.conf found: nothing to change for sleep/wake locking.")
+        print("Now run:  pkill hypridle; hypridle &")
+        return 0
+    restored = 0
+    for f in [sj] + hypridle_files():
+        b = pathlib.Path(str(f) + ".glint-bak")
+        if b.exists():
+            shutil.copy(b, f); restored += 1
+    print(f"Restored {restored} file(s) from backups.")
+    return 0
+
+
+
+def main():
+    base = argparse.ArgumentParser(add_help=False)
+    base.add_argument("--display", type=int, help="monitor number from `glint list` (default: all)")
+    base.add_argument("--json", action="store_true")
+    p = argparse.ArgumentParser(prog="glint", description=__doc__)
+    p.add_argument("--version", action="version", version=VERSION)
+    sub = p.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("list", parents=[base]).set_defaults(f=cmd_list)
+    g = sub.add_parser("get", parents=[base]); g.add_argument("feature", nargs="?", choices=list(FEATURES)); g.set_defaults(f=cmd_get)
+    for nm in ("set", "step"):
+        s = sub.add_parser(nm, parents=[base]); s.add_argument("feature", choices=list(FEATURES))
+        s.add_argument("value", help="0-100, min, max, +5, -5, or a colour name"); s.set_defaults(f=cmd_set)
+    pr = sub.add_parser("profile", parents=[base]); pr.add_argument("action", choices=["apply", "save", "list"])
+    pr.add_argument("name", nargs="?"); pr.set_defaults(f=cmd_profile)
+    sub.add_parser("caps", parents=[base]).set_defaults(f=cmd_caps)
+    sub.add_parser("doctor", parents=[base]).set_defaults(f=cmd_doctor)
+    au = sub.add_parser("auto", parents=[base]); au.add_argument("state", choices=["on", "off", "status"], nargs="?", default="status"); au.set_defaults(f=cmd_auto)
+    sm = sub.add_parser("sync-mode", parents=[base]); sm.add_argument("mode", choices=["light", "dark"]); sm.set_defaults(f=cmd_syncmode)
+    sc = sub.add_parser("screen", parents=[base], help="resolution, refresh rate, scale, position, rotation")
+    sc.add_argument("action", choices=["list", "set", "persist", "revert"]); sc.add_argument("output", nargs="?")
+    sc.add_argument("--resolution"); sc.add_argument("--refresh"); sc.add_argument("--scale", type=float)
+    sc.add_argument("--position"); sc.add_argument("--rotate", type=int, choices=[0, 1, 2, 3])
+    sc.add_argument("--no-save", action="store_true"); sc.add_argument("--to", help="mode to go back to, e.g. 1920x1080@60")
+    sc.set_defaults(f=cmd_screen)
+    ky = sub.add_parser("keys", parents=[base], help="shortcuts (Super+Alt+...), never override your existing binds")
+    ky.add_argument("action", choices=["list", "set", "reset", "on", "off"]); ky.add_argument("name", nargs="?")
+    ky.add_argument("combo", nargs="?", help='e.g. "SUPER ALT, M" or none'); ky.set_defaults(f=cmd_keys)
+    th = sub.add_parser("theme", parents=[base], help="show or change the colours Glint wears")
+    th.add_argument("action", choices=["show", "set"], nargs="?", default="show"); th.add_argument("key", nargs="?"); th.add_argument("value", nargs="?")
+    th.set_defaults(f=cmd_theme)
+    sy = sub.add_parser("sync", parents=[base], help="make GTK/Qt/wal apps wear your Caelestia or pywal colours")
+    sy.add_argument("action", choices=["on", "off", "now", "status"], nargs="?", default="status"); sy.set_defaults(f=cmd_sync)
+    sub.add_parser("migrate", parents=[base]).set_defaults(f=cmd_migrate)
+    un = sub.add_parser("uninstall", parents=[base]); un.add_argument("--purge", action="store_true"); un.set_defaults(f=cmd_uninstall)
+    sub.add_parser("report", parents=[base], help="one shareable file for bug reports / new monitor support").set_defaults(f=cmd_report)
+    lk = sub.add_parser("lock-setup", parents=[base], help="opt-in: power button locks with Caelestia's lock, nothing auto-locks")
+    lk.add_argument("state", choices=["on", "off"]); lk.set_defaults(f=cmd_lock)
+    a = p.parse_args()
+    try:
+        sys.exit(a.f(a))
+    except RuntimeError as e:
+        sys.exit(f"Error: {e}")
+
+
+if __name__ == "__main__":
+    main()
