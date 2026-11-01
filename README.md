@@ -160,6 +160,14 @@ Pass options like this: `curl -fsSL <url> | bash -s -- --no-keys`
 
 **After install:** open **Glint** from your launcher, or press <kbd>Super</kbd>+<kbd>Alt</kbd>+<kbd>M</kbd>. Log out and in once if the installer just added you to the `i2c` group.
 
+### 🔄 Update
+
+Run the same install line again. It upgrades in place and keeps your settings, shortcuts and theme sync.
+
+### 🪄 Caelestia's brightness slider
+
+Caelestia reads your monitor once and then trusts its own copy, so when Glint or a shortcut changes the brightness, Caelestia's slider and OSD could lag. Glint now tells the running shell through its own IPC, after checking what that Caelestia version offers (`glint shell-sync status` shows it). If your Caelestia has no brightness IPC, Glint says so once. Then `glint shell-sync restart` makes it refresh by restarting the shell (at most once every 30 s), and `glint shell-sync off` turns the whole thing off.
+
 ### 🗑 Uninstall (one command)
 
 ```bash

@@ -83,6 +83,16 @@ grep -q "lock_cmd = qs -c caelestia ipc call lock lock" "$HOME/.config/hypr/hypr
 grep -q "dpms off" "$HOME/.config/hypr/hypridle.conf" && grep -q "dpms on" "$HOME/.config/hypr/hypridle.conf" && echo "ok: screen on/off left alone"
 $C lock-setup off >/dev/null; grep -q "terminate-user" "$HOME/.config/caelestia/shell.json" && grep -q "hyprlock" "$HOME/.config/hypr/hypridle.conf" && echo "ok: lock-setup off restores everything"
 $C report > "$HOME/report.out"; grep -q "glint-report" "$HOME/report.out" && ! grep -qi "serial" "$HOME/glint-report.txt" && echo "ok: report written without serials"
+# ---- Caelestia's own slider follows ----
+( export GLINT_QS="$PWD/tests/fake-qs" FAKE_QS_FIRST=1
+  python3 src/bin/glint set brightness 30 2>&1 | grep -q "slider now shows 30" && grep -qx "0.3" "$FAKE_STATE/qs-bright" && echo "ok: Caelestia slider updated (0..1 scale)"
+  echo 100 > "$FAKE_STATE/qs-bright"; python3 src/bin/glint set brightness 40 2>&1 | grep -q "now shows 40" && grep -qx "40" "$FAKE_STATE/qs-bright" && echo "ok: Caelestia slider updated (0..100 scale)"
+  echo 1 > "$FAKE_STATE/qs-bright"; python3 src/bin/glint profile apply night >/dev/null 2>&1; grep -qx "0.2" "$FAKE_STATE/qs-bright" && echo "ok: looks sync the slider too"
+  FAKE_QS_NOBRIGHT=1 python3 src/bin/glint set brightness 50 2>&1 | grep -q "no brightness IPC" && echo "ok: missing IPC explained, nothing guessed"
+  FAKE_QS_DOWN=1 python3 src/bin/glint set brightness 50 >/dev/null 2>&1 && echo "ok: shell not running is not an error"
+  python3 src/bin/glint shell-sync off >/dev/null; echo 1 > "$FAKE_STATE/qs-bright"; python3 src/bin/glint set brightness 10 >/dev/null 2>&1; grep -qx 1 "$FAKE_STATE/qs-bright" && echo "ok: shell-sync off leaves Caelestia alone"
+  python3 src/bin/glint shell-sync auto >/dev/null
+  python3 src/bin/glint shell-sync status | grep -q "brightness: get(), set(value: string)" && echo "ok: status shows what Caelestia offers" )
 # ---- laptop panel (no DDC at all) ----
 BL="$(mktemp -d)"; mkdir -p "$BL/intel_backlight"; echo 400 > "$BL/intel_backlight/brightness"; echo 1000 > "$BL/intel_backlight/max_brightness"; echo raw > "$BL/intel_backlight/type"
 ( export GLINT_BACKLIGHT_DIR="$BL" GLINT_DDCUTIL=/nonexistent

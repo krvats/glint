@@ -2,7 +2,7 @@
 """glint - your monitor, your colours, one tiny tool.
 Resolution, refresh rate, brightness, contrast and colour, themed like your rice.
 Percent values always mean: 0 = the monitor's real lowest, 100 = the monitor's real highest."""
-import argparse, glob, json, os, pathlib, re, shutil, subprocess, sys
+import argparse, glob, json, os, pathlib, re, shutil, subprocess, sys, time
 
 VERSION = "1.0.0"
 HYPRCTL = os.environ.get("GLINT_HYPRCTL", "hyprctl")
@@ -214,14 +214,120 @@ def cmd_get(a):
     return 0
 
 
+# ---------- keep Caelestia's own brightness slider / OSD in step with the monitor ----------
+# Caelestia reads the monitor once and then trusts its own copy, so when Glint (or a shortcut) changes the
+# monitor, its slider goes stale. We ask the running shell, through its own IPC, to update. What the shell offers
+# differs between versions, so we look at what it actually exposes instead of guessing.
+QS = os.environ.get("GLINT_QS", "qs")
+QS_CONFIG = os.environ.get("GLINT_QS_CONFIG", "caelestia")
+SHELLSYNC = CONFIG / "shell-sync"          # "auto" (default) | "restart" | "off"
+
+
+def shell_mode():
+    try:
+        return SHELLSYNC.read_text().strip() or "auto"
+    except OSError:
+        return "auto"
+
+
+def shell_ipc():
+    """{target: {function: (args, returns)}} of the running Caelestia shell, or None when it is not running."""
+    try:
+        out = tool(QS, "-c", QS_CONFIG, "ipc", "show")
+    except Exception:
+        return None
+    res, cur = {}, None
+    for ln in out.splitlines():
+        t = re.match(r"^target\s+(\S+)", ln)
+        if t:
+            cur = res.setdefault(t.group(1), {}); continue
+        f = re.match(r"^\s+function\s+(\w+)\((.*?)\)(?::\s*(\w+))?", ln)
+        if f and cur is not None:
+            cur[f.group(1)] = (f.group(2).strip(), f.group(3) or "")
+    return res
+
+
+def shell_sync_brightness(percent):
+    """Returns (ok, message)."""
+    mode = shell_mode()
+    if mode == "off":
+        return False, "shell sync is off"
+    ipc = shell_ipc()
+    if ipc is None:
+        return False, "Caelestia shell is not running"
+    tgt = next((n for n in ipc if n.lower() == "brightness"), None) or next((n for n in ipc if "bright" in n.lower()), None)
+    fn = ipc.get(tgt, {}) if tgt else {}
+    if tgt and "get" in fn and "set" in fn:
+        try:
+            cur = float(tool(QS, "-c", QS_CONFIG, "ipc", "call", tgt, "get").split()[0])
+            frac = cur <= 1.0                        # 0..1 or 0..100: the shell tells us by what it reports
+            tool(QS, "-c", QS_CONFIG, "ipc", "call", tgt, "set", f"{(percent / 100 if frac else percent):.4g}")
+            new = float(tool(QS, "-c", QS_CONFIG, "ipc", "call", tgt, "get").split()[0])
+            if abs((new * 100 if frac else new) - percent) <= 3:
+                return True, f"Caelestia's brightness slider now shows {percent}%"
+            return False, f"Caelestia answered {new} instead of {percent}%"
+        except Exception as e:
+            return False, f"Caelestia brightness IPC failed: {e}"
+    if mode == "restart":
+        stamp = CONFIG / "shell-restart"
+        if stamp.exists() and time.time() - stamp.stat().st_mtime < 30:
+            return False, "shell was restarted a moment ago"
+        CONFIG.mkdir(parents=True, exist_ok=True); stamp.write_text("x")
+        cae = shutil.which("caelestia")
+        if cae:
+            sh(cae, "shell", "-k"); subprocess.Popen([cae, "shell", "-d"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+            return True, "Caelestia shell restarted to re-read the monitor"
+        return False, "caelestia command not found"
+    return False, "this Caelestia has no brightness IPC (run: glint shell-sync restart, to refresh it by restarting the shell)"
+
+
+def sync_shell_after(mons, quiet=True):
+    """After Glint changed the brightness of exactly one DDC monitor, tell Caelestia."""
+    if len(mons) != 1 or mons[0].get("backlight"):
+        return
+    try:
+        v = getvcp(mons[0], "brightness")
+        ok, msg = shell_sync_brightness(round(v["cur"] * 100 / (v["max"] or 100)))
+    except Exception as e:
+        ok, msg = False, str(e)
+    hint = CONFIG / "shell-hint-shown"
+    if ok:
+        print(msg)
+    elif not quiet:
+        print(msg, file=sys.stderr)
+    elif "no brightness IPC" in msg and not hint.exists():      # worth saying once, never nagging
+        CONFIG.mkdir(parents=True, exist_ok=True); hint.write_text("x"); print(msg, file=sys.stderr)
+
+
+def cmd_shellsync(a):
+    if a.action in ("auto", "restart", "off"):
+        CONFIG.mkdir(parents=True, exist_ok=True); SHELLSYNC.write_text(a.action)
+        print(f"Caelestia brightness sync: {a.action}"); return 0
+    ipc = shell_ipc()
+    print(f"mode: {shell_mode()}")
+    if ipc is None:
+        print("Caelestia shell: not running (or `qs` not found), nothing to sync"); return 0
+    print("Caelestia shell: running")
+    for t, fns in ipc.items():
+        print(f"  {t}: " + ", ".join(f"{n}({v[0]})" for n, v in fns.items()))
+    if a.action == "now":
+        mons = [m for m in chosen(a) if not m.get("backlight")]
+        if len(mons) != 1:
+            print("Syncing needs exactly one external monitor."); return 1
+        sync_shell_after(mons, quiet=False)
+    return 0
+
+
 def cmd_set(a):
-    rc = 0
-    for m in chosen(a):
+    rc, mons = 0, chosen(a)
+    for m in mons:
         try:
             setvcp(m, a.feature, target(m, a.feature, a.value))
             print(f"{name(m)}: {a.feature} set")
         except Exception as e:
             print(f"{name(m)}: {e}", file=sys.stderr); rc = 1
+    if a.feature == "brightness" and rc == 0:
+        sync_shell_after(mons)
     return rc
 
 
@@ -263,6 +369,8 @@ def cmd_profile(a):
             except Exception as e:
                 print(f"{name(m)}: {feat}: {e}", file=sys.stderr); rc = 1
         print(f"{name(m)}: profile '{a.name}' applied")
+    if "brightness" in settings and rc == 0:
+        sync_shell_after(chosen(a))
     return rc
 
 
@@ -294,6 +402,11 @@ def cmd_doctor(a):
     p = palette()
     print(f"[OK] theme: following {p['_source']} ({p['_name']}, {p['_mode']})" if p else "[--] theme: no Caelestia/pywal colours found, using your GTK theme")
     print(f"[OK] app sync: {'on' if (SYSD / 'glint-sync.path').exists() else 'off  (enable with: glint sync on)'}")
+    ipc = shell_ipc()
+    if ipc is not None:
+        has = any("bright" in t.lower() and "get" in f and "set" in f for t, f in ipc.items())
+        print("[OK] Caelestia brightness slider: kept in sync" if has else
+              "[--] Caelestia brightness slider: this Caelestia has no brightness IPC, so its slider can lag. Fix: glint shell-sync restart")
     try:
         print(f"[OK] screen: {', '.join(o['name'] + ' ' + str(o['width']) + 'x' + str(o['height']) + '@' + str(o['refresh']) for o in outputs())}")
     except Exception as e:
@@ -1133,6 +1246,8 @@ def main():
     th.set_defaults(f=cmd_theme)
     sy = sub.add_parser("sync", parents=[base], help="make GTK/Qt/wal apps wear your Caelestia or pywal colours")
     sy.add_argument("action", choices=["on", "off", "now", "status"], nargs="?", default="status"); sy.set_defaults(f=cmd_sync)
+    ss = sub.add_parser("shell-sync", parents=[base], help="keep Caelestia's brightness slider in step with the monitor")
+    ss.add_argument("action", choices=["status", "now", "auto", "restart", "off"], nargs="?", default="status"); ss.set_defaults(f=cmd_shellsync)
     sub.add_parser("migrate", parents=[base]).set_defaults(f=cmd_migrate)
     un = sub.add_parser("uninstall", parents=[base]); un.add_argument("--purge", action="store_true")
     un.add_argument("--all", action="store_true", help="remove everything Glint installed, including the program itself and system files")

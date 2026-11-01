@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Fake `qs` (Quickshell) with Caelestia's IPC, for offline tests. Brightness state in $FAKE_STATE/qs-bright ($FAKE_QS_SCALE: 1 = 0..1, 100 = 0..100)
+S="$FAKE_STATE/qs-bright"; [ -f "$S" ] || echo "${FAKE_QS_FIRST:-1}" > "$S"
+[ "$1" = "-c" ] && shift 2
+[ "$FAKE_QS_DOWN" = 1 ] && exit 1
+[ "$2" = show ] && { echo "target drawers"; echo "  function toggle(name: string): void"
+  [ "$FAKE_QS_NOBRIGHT" = 1 ] || { echo "target brightness"; echo "  function get(): real"; echo "  function set(value: string): string"; }; exit 0; }
+[ "$2" = call ] && [ "$3" = brightness ] || exit 1
+[ "$4" = get ] && cat "$S"
+[ "$4" = set ] && echo "$5" > "$S" && echo "$5"
+exit 0

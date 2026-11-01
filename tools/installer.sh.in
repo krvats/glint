@@ -120,7 +120,8 @@ if [ "$DEPS" = 1 ] && [ "$DRY" != 1 ]; then
 fi
 
 # ---------- unpack and install our files ----------
-say "Installing Glint into $PREFIX"
+if [ -x "$PREFIX/bin/glint" ] || command -v glint >/dev/null 2>&1; then say "Upgrading Glint in $PREFIX (your settings, shortcuts and theme sync stay as they are)"
+else say "Installing Glint into $PREFIX"; fi
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 base64 -d <<'__GLINT_PAYLOAD__' | tar xz -C "$TMP"
 @PAYLOAD@
