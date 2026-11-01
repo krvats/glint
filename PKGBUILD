@@ -1,6 +1,6 @@
 # Maintainer: krvats
 pkgname=glint
-pkgver=1.1.2
+pkgver=1.1.3
 pkgrel=1
 pkgdesc="Resolution, refresh rate, brightness and colour for your monitor, themed like your rice (Caelestia, pywal)"
 arch=('any')

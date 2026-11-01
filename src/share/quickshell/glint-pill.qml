@@ -16,7 +16,11 @@ ShellRoot {
     property color accentFg: "#1e1e2e"
     property int brightness: 50
     property var looks: []
-    property bool open: card.hovered
+    property bool pinned: false                       // click the icon to keep it open (handy for screenshots)
+    property bool hot: card.hovered || pinned
+    property bool open: false
+    onHotChanged: { if (hot) { closer.stop(); open = true } else closer.restart() }
+    Timer { id: closer; interval: 900; onTriggered: root.open = false }   // small grace period, no flicker
 
     // ---- colours: whatever `glint theme` says right now
     Process {
@@ -73,8 +77,8 @@ ShellRoot {
         WlrLayershell.namespace: "glint-pill"
         WlrLayershell.layer: WlrLayer.Overlay
         color: "transparent"
-        implicitWidth: 260
-        implicitHeight: root.open ? 190 : 36
+        implicitWidth: 280
+        implicitHeight: 420          // room to grow; only the card itself takes clicks (mask below)
         mask: Region { item: card }
 
         Rectangle {
@@ -86,7 +90,7 @@ ShellRoot {
             anchors.left: root.pos.indexOf("left") >= 0 ? parent.left : undefined
             anchors.right: root.pos.indexOf("left") < 0 ? parent.right : undefined
             width: root.open ? 260 : 36
-            height: root.open ? 190 : 36
+            height: root.open ? col.implicitHeight + 54 : 36      // grows with its content, never cuts it off
             radius: root.open ? 20 : 18
             color: root.open ? root.bg : root.accent
             border.width: 1
@@ -104,10 +108,14 @@ ShellRoot {
                 horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter
                 text: "✦"; font.pixelSize: 17
                 color: root.open ? root.accent : root.accentFg
+                MouseArea { anchors.fill: parent; onClicked: root.pinned = !root.pinned }
             }
 
             Column {
+                id: col
                 visible: root.open
+                opacity: root.open ? 1 : 0
+                Behavior on opacity { NumberAnimation { duration: 120 } }
                 anchors { left: parent.left; right: parent.right; top: parent.top; margins: 14; topMargin: 40 }
                 spacing: 12
 
