@@ -9,7 +9,10 @@ mkdir -p "$bindir"
 install -m755 "$here/src/bin/glint" "$bindir/glint"
 install -m755 "$here/src/bin/glint-gui" "$bindir/glint-gui"
 echo "✓ updated glint and glint-gui in $bindir"
+sharedir="${GLINT_PREFIX:-$HOME/.local}/share/glint"
+mkdir -p "$sharedir/quickshell" && install -m644 "$here/src/share/quickshell/glint-pill.qml" "$sharedir/quickshell/glint-pill.qml"
+echo "✓ installed the Caelestia hover icon (turn on with: glint pill on)"
 "$bindir/glint" migrate >/dev/null 2>&1 || true      # picks up the old ~/.config/cdisplay folder if it is still there
 echo "✓ settings kept"
 echo; "$bindir/glint" doctor || true
-echo; echo "Done. Open Glint again. To remove everything later: glint uninstall --all"
+echo; echo "Done. Type  glint  to open it,  glint popup  for the small panel,  glint pill on  for the hover icon. To remove everything later: glint uninstall --all"

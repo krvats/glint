@@ -714,6 +714,7 @@ def SCREENS_prev(o):
 KEYS = CONFIG / "keys.json"
 ACTIONS = {  # name: (default combo, command, label)
     "open":            ("SUPER ALT, M",    "glint-gui",                  "Open Glint"),
+    "popup":           ("SUPER ALT, P",    "glint popup",                "Quick popup"),
     "brightness_up":   ("SUPER ALT, Up",   "glint step brightness +10",  "Brightness up"),
     "brightness_down": ("SUPER ALT, Down", "glint step brightness -10",  "Brightness down"),
     "night":           ("SUPER ALT, N",    "glint profile apply night",  "Night look"),
@@ -793,6 +794,7 @@ def key_lines():
 
 
 def cmd_keys(a):
+    CONFIG.mkdir(parents=True, exist_ok=True)
     k = load_keys()
     if a.action == "list":
         use, skip = bind_plan()
@@ -1214,13 +1216,133 @@ def cmd_lock(a):
 
 
 
+# ---------- just type `glint`: open the app, or show a tidy panel when there is no screen to open it on ----------
+POPUPCFG = CONFIG / "popup.json"
+POPUP_DEFAULT = {"position": "top-right", "show": ["brightness", "contrast", "colour", "rgb", "looks"], "pill": False}
+
+
+def popup_cfg():
+    try:
+        d = json.load(open(POPUPCFG))
+    except Exception:
+        d = {}
+    return {**POPUP_DEFAULT, **d}
+
+
+def gui_cmd(*args):
+    cand = HERE / "glint-gui"
+    exe = str(cand) if cand.exists() else shutil.which("glint-gui")
+    return [exe, *args] if exe else None
+
+
+def has_display():
+    return bool(os.environ.get("WAYLAND_DISPLAY") or os.environ.get("DISPLAY"))
+
+
+def launch_gui(*args):
+    cmd = gui_cmd(*args)
+    if not cmd:
+        raise RuntimeError("glint-gui not found. Reinstall Glint, or run: bash apply-fix.sh")
+    subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, start_new_session=True)
+
+
+def cmd_popup(a):
+    """Small floating panel near the corner. Run it again to close it. Also bound to Super+Alt+P."""
+    if not has_display():
+        raise RuntimeError("no screen to open a popup on (no WAYLAND_DISPLAY / DISPLAY). Try plain `glint` for the terminal view.")
+    launch_gui("--popup"); return 0
+
+
+def cmd_home(a):
+    """Plain `glint`. On a desktop: opens the main Glint window. In a bare terminal / SSH: prints a compact panel."""
+    if has_display() and not getattr(a, "text", False):
+        launch_gui(); print("Opening Glint..."); return 0
+    tty = sys.stdout.isatty()
+    c = (lambda n, t: f"\033[38;5;{n}m{t}\033[0m") if tty else (lambda n, t: t)
+    print(c(111, "  ✦ Glint") + c(245, "   your monitor, wearing your rice\n"))
+    try:
+        for m in detect():
+            row = []
+            for f in ("brightness", "contrast"):
+                try:
+                    v = getvcp(m, f); pc = round(v["cur"] * 100 / (v["max"] or 100))
+                except Exception:
+                    continue
+                row.append(f"{f:<10} {c(111, '█' * (pc // 5) + '░' * (20 - pc // 5))} {pc:>3}%")
+            print(c(183, "  " + name(m))); [print("    " + r) for r in row]
+    except Exception as e:
+        print(c(203, f"  Could not read the monitor: {e}"))
+    print()
+    print("  " + c(183, "Try:") + "  glint step brightness +10   ·   glint profile apply night   ·   glint screen list")
+    print("  " + c(183, "Also:") + " glint popup   ·   glint keys list   ·   glint pill on   ·   glint doctor   ·   glint -h")
+    return 0
+
+
+# ---------- the little icon beside Caelestia: hover it for quick settings ----------
+PILL_QML = next((p / "quickshell/glint-pill.qml" for p in SHARE if (p / "quickshell/glint-pill.qml").exists()), None)
+PILL_PID = CONFIG / "pill.pid"
+
+
+def pill_running():
+    try:
+        pid = int(PILL_PID.read_text())
+        os.kill(pid, 0)
+        return pid
+    except Exception:
+        return None
+
+
+def pill_start():
+    if pill_running():
+        return True
+    if not PILL_QML:
+        raise RuntimeError("glint-pill.qml not found. Run apply-fix.sh again.")
+    qs = shutil.which(QS)
+    if not qs:
+        raise RuntimeError("Quickshell (`qs`) not found. Caelestia needs it, so install Caelestia first.")
+    env = dict(os.environ, GLINT_PILL_POS=popup_cfg()["position"], GLINT_CLI=str(HERE / "glint"))
+    pr = subprocess.Popen([qs, "-p", str(PILL_QML)], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    CONFIG.mkdir(parents=True, exist_ok=True); PILL_PID.write_text(str(pr.pid))
+    return True
+
+
+def pill_stop():
+    pid = pill_running()
+    if pid:
+        try:
+            os.kill(pid, 15)
+        except OSError:
+            pass
+    PILL_PID.unlink(missing_ok=True)
+
+
+def cmd_pill(a):
+    cfg = popup_cfg()
+    ap = XDG / "autostart/glint-pill.desktop"
+    if a.state in ("on", "restart"):
+        pill_stop(); pill_start()
+        cfg["pill"] = True
+        ap.parent.mkdir(parents=True, exist_ok=True)
+        ap.write_text("[Desktop Entry]\nType=Application\nName=Glint pill\nExec=glint pill start\nX-GNOME-Autostart-Delay=3\nNoDisplay=true\n")
+        print("Glint pill is on. Hover the small icon in the corner. It comes back at every login.")
+    elif a.state == "start":
+        pill_start(); return 0
+    elif a.state == "off":
+        pill_stop(); cfg["pill"] = False; ap.unlink(missing_ok=True); print("Glint pill is off.")
+    else:
+        print("on" if pill_running() else "off"); return 0
+    CONFIG.mkdir(parents=True, exist_ok=True); json.dump(cfg, open(POPUPCFG, "w"), indent=2)
+    return 0
+
+
 def main():
     base = argparse.ArgumentParser(add_help=False)
     base.add_argument("--display", type=int, help="monitor number from `glint list` (default: all)")
     base.add_argument("--json", action="store_true")
     p = argparse.ArgumentParser(prog="glint", description=__doc__)
     p.add_argument("--version", action="version", version=VERSION)
-    sub = p.add_subparsers(dest="cmd", required=True)
+    sub = p.add_subparsers(dest="cmd")
+    p.add_argument("--text", action="store_true", help="with no command: print the terminal panel instead of opening the app")
     sub.add_parser("list", parents=[base]).set_defaults(f=cmd_list)
     g = sub.add_parser("get", parents=[base]); g.add_argument("feature", nargs="?", choices=list(FEATURES)); g.set_defaults(f=cmd_get)
     for nm in ("set", "step"):
@@ -1255,11 +1377,19 @@ def main():
     sub.add_parser("report", parents=[base], help="one shareable file for bug reports / new monitor support").set_defaults(f=cmd_report)
     lk = sub.add_parser("lock-setup", parents=[base], help="opt-in: power button locks with Caelestia's lock, nothing auto-locks")
     lk.add_argument("state", choices=["on", "off"]); lk.set_defaults(f=cmd_lock)
+    sub.add_parser("open", help="open the main Glint window").set_defaults(f=lambda a: (launch_gui(), 0)[1])
+    sub.add_parser("popup", aliases=["toggle"], help="small quick-settings popup (run again to close)").set_defaults(f=cmd_popup)
+    pl = sub.add_parser("pill", help="tiny hover icon next to the Caelestia shell: on | off | status")
+    pl.add_argument("state", choices=["on", "off", "status", "start", "restart"], nargs="?", default="status"); pl.set_defaults(f=cmd_pill)
     a = p.parse_args()
+    if not getattr(a, "f", None):
+        a.f = cmd_home
     try:
         sys.exit(a.f(a))
     except RuntimeError as e:
         sys.exit(f"Error: {e}")
+    except BrokenPipeError:              # e.g. `glint | head`
+        sys.exit(0)
 
 
 if __name__ == "__main__":

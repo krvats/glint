@@ -17,7 +17,7 @@ package() {
   install -Dm755 src/bin/glint "$pkgdir/usr/bin/glint"
   install -Dm755 src/bin/glint-gui "$pkgdir/usr/bin/glint-gui"
   install -d "$pkgdir/usr/share/glint"
-  cp -r src/share/profiles src/share/monitors "$pkgdir/usr/share/glint/"
+  cp -r src/share/profiles src/share/monitors src/share/quickshell "$pkgdir/usr/share/glint/"
   install -Dm644 src/share/glint.desktop "$pkgdir/usr/share/applications/glint.desktop"
   install -Dm644 src/system/60-glint-i2c.rules "$pkgdir/usr/lib/udev/rules.d/60-glint-i2c.rules"
   install -Dm644 src/system/glint.conf "$pkgdir/usr/lib/modules-load.d/glint.conf"

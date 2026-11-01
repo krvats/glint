@@ -132,7 +132,7 @@ else
   install -Dm755 "$TMP/bin/glint" "$PREFIX/bin/glint"
   install -Dm755 "$TMP/bin/glint-gui" "$PREFIX/bin/glint-gui"
   mkdir -p "$PREFIX/share/glint"
-  cp -r "$TMP/share/profiles" "$TMP/share/monitors" "$PREFIX/share/glint/"
+  cp -r "$TMP/share/profiles" "$TMP/share/monitors" "$TMP/share/quickshell" "$PREFIX/share/glint/"
   install -Dm644 "$TMP/share/glint.desktop" "$PREFIX/share/applications/glint.desktop"
   command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database "$PREFIX/share/applications" >/dev/null 2>&1 || true
   ok "glint, glint-gui and the launcher entry"

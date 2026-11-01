@@ -4,6 +4,10 @@ import json, os, pathlib, shutil, subprocess, sys, threading
 import gi
 gi.require_version("Gtk", "4.0"); gi.require_version("Adw", "1")
 from gi.repository import Adw, Gdk, Gio, GLib, Gtk
+try:                                    # optional: a real layer-shell popup (no window-manager tricks needed)
+    gi.require_version("Gtk4LayerShell", "1"); from gi.repository import Gtk4LayerShell as LS
+except Exception:
+    LS = None
 
 H = pathlib.Path.home()
 CFG = pathlib.Path(os.environ.get("XDG_CONFIG_HOME", H / ".config")) / "glint"
@@ -14,6 +18,43 @@ CLI = _here if os.path.exists(_here) else (shutil.which("glint") or "glint")
 LABELS = {"brightness": "Brightness", "contrast": "Contrast", "red": "Red", "green": "Green", "blue": "Blue"}
 COLOURS = ["srgb", "native", "4000k", "5000k", "6500k", "7500k", "8200k", "9300k", "11500k", "user"]
 SOURCES = ["auto", "caelestia", "pywal", "gtk", "system"]
+POPUP_FILE = CFG / "popup.json"
+POSITIONS = ["top-right", "top-left", "bottom-right", "bottom-left", "top", "bottom"]
+POPUP_PARTS = [("contrast", "Contrast"), ("colour", "Colour temperature"), ("rgb", "Red / green / blue"), ("looks", "One-tap looks")]
+
+
+def popup_cfg():
+    d = {"position": "top-right", "show": ["contrast", "colour", "rgb", "looks"], "pill": False}
+    try: d.update(json.load(open(POPUP_FILE)))
+    except Exception: pass
+    return d
+
+def save_popup(d):
+    CFG.mkdir(parents=True, exist_ok=True); json.dump(d, open(POPUP_FILE, "w"), indent=2)
+
+
+# ---------------------------------------------------------------- shortcut capture: press the keys, Glint writes them down
+MOD_KEYS = {"Shift_L", "Shift_R", "Control_L", "Control_R", "Alt_L", "Alt_R", "Meta_L", "Meta_R", "Super_L", "Super_R",
+            "Hyper_L", "Hyper_R", "ISO_Level3_Shift", "Caps_Lock", "Num_Lock"}
+
+def mods_of(state):
+    """Hyprland-style modifier words from a GTK modifier mask, in a fixed order."""
+    out = []
+    for flag, word in ((Gdk.ModifierType.SUPER_MASK, "SUPER"), (Gdk.ModifierType.CONTROL_MASK, "CTRL"),
+                       (Gdk.ModifierType.ALT_MASK, "ALT"), (Gdk.ModifierType.SHIFT_MASK, "SHIFT")):
+        if state & flag: out.append(word)
+    return out
+
+def key_name(keyval, keycode):
+    """The key as Hyprland spells it (m, Up, F9, space...), ignoring Shift so SHIFT+1 stays '1'."""
+    try:
+        ok, kv, *_ = Gdk.Display.get_default().translate_key(keycode, Gdk.ModifierType(0), 0)
+        if ok and kv: keyval = kv
+    except Exception: pass
+    return Gdk.keyval_name(Gdk.keyval_to_lower(keyval)) or ""
+
+def combo_text(mods, key=""):
+    return " ".join(mods) + (f", {key}" if key else "")
 
 
 def cli(*args):
@@ -77,6 +118,11 @@ scale trough {{ min-height: 8px; border-radius: 999px; }} scale highlight {{ bor
 scale slider {{ min-width: 20px; min-height: 20px; border-radius: 999px; background: @accent_bg_color; box-shadow: 0 0 0 3px alpha(@accent_bg_color, .25); }}
 scale.red highlight, scale.red slider {{ background: #ff6b81; }} scale.green highlight, scale.green slider {{ background: #5fd38d; }}
 scale.blue highlight, scale.blue slider {{ background: #6ea8ff; }}
+window.glint-popwin {{ background: transparent; }}
+.glint-pop {{ background: @window_bg_color; color: @window_fg_color; border-radius: {r + 6}px; border: 1px solid alpha(@window_fg_color, .14);
+  box-shadow: 0 10px 34px -10px rgba(0,0,0,.55); padding: 14px; }}
+.glint-pop label.pop-title {{ font-weight: 800; font-size: 16px; }}
+.glint-rec {{ background: alpha(@accent_bg_color, .2); box-shadow: inset 0 0 0 2px @accent_bg_color; }}
 headerbar {{ box-shadow: none; }} dialog, window.dialog {{ border-radius: {r + 4}px; }}
 """
     if p:
@@ -119,7 +165,8 @@ class Theme:
 class Win(Adw.ApplicationWindow):
     def __init__(self, app):
         super().__init__(application=app, title="Glint", default_width=600, default_height=780)
-        self.timers = {}; self.theme = app.theme; self.sync_on = False
+        self.connect("close-request", lambda *_: (setattr(app, "main", None), False)[1])
+        self.timers = {}; self.theme = app.theme; self.sync_on = False; self.rec = None
         view = Adw.ToolbarView(); bar = Adw.HeaderBar()
         refresh = Gtk.Button(icon_name="view-refresh-symbolic", tooltip_text="Reload"); refresh.connect("clicked", lambda *_: self.load())
         bar.pack_start(refresh)
@@ -242,13 +289,47 @@ class Win(Adw.ApplicationWindow):
         sw.set_active(keys["enabled"])
         sw.connect("notify::active", lambda r, _p: self.run_bg("keys", "on" if r.get_active() else "off"))
         g0 = Adw.PreferencesGroup(); g0.add(sw); self.pages["keys"].append(g0)
-        g = Adw.PreferencesGroup(title="Change any of them", description="Write it like SUPER ALT, M. Press Enter or the tick to save.")
+        g = Adw.PreferencesGroup(title="Change any of them", description="Click Record, then just press the keys you want. Glint writes it down for you. Esc cancels, Clear removes it.")
         for k in keys["keys"]:
-            row = Adw.EntryRow(title=k["label"] + ("   (taken, skipped)" if k["status"].startswith("TAKEN") else ""), show_apply_button=True)
-            row.set_text(k["combo"])
-            row.connect("apply", lambda r, name=k["name"]: self.run_bg("keys", "set", name, r.get_text().strip() or "none"))
-            g.add(row)
+            taken = k["status"].startswith("TAKEN")
+            row = Adw.ActionRow(title=k["label"], subtitle=("Taken by another shortcut, skipped. Record a different one." if taken else k["status"] if k["status"] == "off" else ""))
+            row.set_subtitle_lines(1)
+            btn = Gtk.Button(label=k["combo"] or "(none)", valign=Gtk.Align.CENTER, tooltip_text="Click, then press your shortcut"); btn.add_css_class("pill")
+            clr = Gtk.Button(icon_name="edit-clear-symbolic", valign=Gtk.Align.CENTER, tooltip_text="Remove this shortcut"); clr.add_css_class("flat")
+            btn.connect("clicked", lambda b, n=k["name"], c=k["combo"]: self.record_key(b, n, c))
+            clr.connect("clicked", lambda _b, n=k["name"]: self.run_bg("keys", "set", n, "none"))
+            row.add_suffix(btn); row.add_suffix(clr); row.set_activatable_widget(btn); g.add(row)
         self.pages["keys"].append(g)
+
+    def record_key(self, btn, action, current):
+        """Listen to the keyboard until a modifier+key is pressed; show what is held live."""
+        self.stop_record()
+        btn.set_label("Press your keys..."); btn.add_css_class("glint-rec")
+        ctl = Gtk.EventControllerKey(); ctl.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        def restore(text=None):
+            self.stop_record(); btn.set_label(text if text is not None else (current or "(none)"))
+        def pressed(c, keyval, keycode, state):
+            name = Gdk.keyval_name(keyval) or ""
+            mods = mods_of(state)
+            if name in MOD_KEYS:
+                btn.set_label(combo_text(mods) + " + ..." if mods else "Press your keys..."); return True
+            if name == "Escape" and not mods: restore(); self.say("Cancelled"); return True
+            if not mods:
+                btn.set_label("Hold Super, Alt or Ctrl first"); return True
+            combo = combo_text(mods, key_name(keyval, keycode))
+            restore(combo); self.say(f"Saving {combo}...")
+            self.run_bg("keys", "set", action, combo); return True
+        ctl.connect("key-pressed", pressed)
+        def released(c, keyval, keycode, state):
+            if not self.rec: return
+            btn.set_label(combo_text(mods_of(state)) + " + ..." if mods_of(state) else "Press your keys...")
+        ctl.connect("key-released", released)
+        self.add_controller(ctl); self.rec = (ctl, btn, current)
+        GLib.timeout_add_seconds(15, lambda: (self.rec and self.rec[1] is btn and restore(), False)[1])
+
+    def stop_record(self):
+        if getattr(self, "rec", None):
+            ctl, btn, _ = self.rec; self.remove_controller(ctl); btn.remove_css_class("glint-rec"); self.rec = None
 
     def run_bg(self, *args):
         def work():
@@ -289,6 +370,24 @@ class Win(Adw.ApplicationWindow):
         sync.set_active(self.sync_on)
         sync.connect("notify::active", lambda r, _p: self.run_bg("sync", "on" if r.get_active() else "off")); sg.add(sync)
         self.pages["look"].append(sg)
+        pc = popup_cfg()
+        pg = Adw.PreferencesGroup(title="Quick popup", description="Type `glint popup` (or press Super+Alt+P) for a small panel. Brightness is always first.")
+        pos = Adw.ComboRow(title="Where it appears", model=Gtk.StringList.new([p.replace("-", " ").capitalize() for p in POSITIONS]))
+        pos.set_selected(POSITIONS.index(pc["position"]) if pc["position"] in POSITIONS else 0)
+        def set_pos(r, _p):
+            c = popup_cfg(); c["position"] = POSITIONS[r.get_selected()]; save_popup(c)
+            if c.get("pill"): self.run_quiet("pill", "restart")
+        pos.connect("notify::selected", set_pos); pg.add(pos)
+        for key, label in POPUP_PARTS:
+            sw2 = Adw.SwitchRow(title="Show " + label.lower(), active=key in pc["show"])
+            def tog(r, _p, key=key):
+                c = popup_cfg(); sh = [x for x in c["show"] if x != key]
+                if r.get_active(): sh.append(key)
+                c["show"] = sh; save_popup(c)
+            sw2.connect("notify::active", tog); pg.add(sw2)
+        pill = Adw.SwitchRow(title="Hover icon beside Caelestia", subtitle="A tiny icon in the corner. Hover it for brightness, looks and all settings. Needs Caelestia / Quickshell.", active=bool(pc.get("pill")))
+        pill.connect("notify::active", lambda r, _p: self.run_bg("pill", "on" if r.get_active() else "off")); pg.add(pill)
+        self.pages["look"].append(pg)
         self.note("look", f"More: {CFG}/theme.json (colours, accent) or your own CSS in {CFG}/theme.css")
 
     def run_quiet(self, *args):
@@ -357,15 +456,155 @@ class Win(Adw.ApplicationWindow):
         threading.Thread(target=work, daemon=True).start()
 
 
-class App(Adw.Application):
-    def __init__(self):
-        super().__init__(application_id="io.github.krvats.glint")
-        self.theme = None
-        self.connect("activate", self.on_activate)
+# ---------------------------------------------------------------- popup: small, simple, brightness first
+class PopupWin(Gtk.Window):
+    W = 340
 
-    def on_activate(self, _a):
+    def __init__(self, app):
+        super().__init__(application=app, title="Glint quick settings", decorated=False, resizable=False, default_width=self.W)
+        self.app = app; self.timers = {}; self.seen_active = False; self.cfg = popup_cfg()
+        self.add_css_class("glint-popwin")
+        self.body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10); self.body.add_css_class("glint-pop"); self.body.set_size_request(self.W, -1)
+        self.set_child(self.body)
+        head = Gtk.Box(spacing=8); t = Gtk.Label(label="✦ Glint", xalign=0, hexpand=True); t.add_css_class("pop-title"); head.append(t)
+        full = Gtk.Button(icon_name="preferences-system-symbolic", tooltip_text="All settings"); full.add_css_class("flat"); full.connect("clicked", self.open_full)
+        shut = Gtk.Button(icon_name="window-close-symbolic", tooltip_text="Close (Esc)"); shut.add_css_class("flat"); shut.connect("clicked", lambda *_: self.close())
+        head.append(full); head.append(shut); self.body.append(head)
+        self.content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10); self.body.append(self.content)
+        self.status = Gtk.Label(label="Reading your monitor...", xalign=0); self.status.add_css_class("dim-label"); self.body.append(self.status)
+        key = Gtk.EventControllerKey(); key.connect("key-pressed", lambda c, kv, kc, st: (self.close(), True)[1] if kv == Gdk.KEY_Escape else False); self.add_controller(key)
+        self.connect("notify::is-active", self.on_active)
+        self.place(); self.load()
+
+    # -- where it sits: real layer-shell when available, otherwise ask Hyprland to float + move it
+    def place(self):
+        pos = self.cfg["position"]
+        if LS and LS.is_supported():
+            LS.init_for_window(self); LS.set_namespace(self, "glint-popup"); LS.set_layer(self, LS.Layer.OVERLAY)
+            LS.set_keyboard_mode(self, LS.KeyboardMode.ON_DEMAND)
+            for edge, name in ((LS.Edge.TOP, "top"), (LS.Edge.BOTTOM, "bottom"), (LS.Edge.LEFT, "left"), (LS.Edge.RIGHT, "right")):
+                LS.set_anchor(self, edge, name in pos); LS.set_margin(self, edge, 14)
+            self.layer = True
+        else:
+            self.layer = False
+            GLib.timeout_add(250, self.hypr_place)
+
+    def hypr_place(self):
+        hc = shutil.which("hyprctl")
+        if not hc: return False
+        try:
+            win = next(w for w in json.loads(subprocess.run([hc, "clients", "-j"], capture_output=True, text=True, timeout=3).stdout)
+                       if w.get("title") == "Glint quick settings")
+            mon = next(m for m in json.loads(subprocess.run([hc, "monitors", "-j"], capture_output=True, text=True, timeout=3).stdout) if m.get("focused"))
+            sc = mon.get("scale") or 1; mw, mh = int(mon["width"] / sc), int(mon["height"] / sc)
+            w, h = win["size"]; pos = self.cfg["position"]
+            x = mon["x"] + (14 if "left" in pos else mw - w - 14 if "right" in pos else (mw - w) // 2)
+            y = mon["y"] + (mh - h - 14 if "bottom" in pos else 14)
+            a = f"address:{win['address']}"
+            subprocess.run([hc, "--batch", f"dispatch setfloating {a} ; dispatch movewindowpixel exact {x} {y},{a}"], capture_output=True, timeout=3)
+        except Exception: pass
+        return False
+
+    def on_active(self, *_):
+        if self.is_active(): self.seen_active = True; return
+        if self.seen_active: GLib.timeout_add(300, self.maybe_close)    # clicked somewhere else: tidy up
+
+    def maybe_close(self):
+        if not self.is_active(): self.close()
+        return False
+
+    def open_full(self, *_):
+        self.app.show_main(); self.close()
+
+    def say(self, text): GLib.idle_add(self.status.set_text, text)
+
+    def load(self):
+        def work():
+            rc, out, err = cli("get", "--json"); _, prof, _ = cli("profile", "list", "--json")
+            disp = json.loads(out)["displays"] if rc == 0 and out.strip() else []
+            try: profiles = json.loads(prof or "[]")
+            except Exception: profiles = []
+            GLib.idle_add(self.build, disp, profiles, "" if rc == 0 else (err or "No monitor answered. Open all settings and run Glint's doctor."))
+        threading.Thread(target=work, daemon=True).start()
+
+    def slider(self, d, feat, label):
+        v = d["values"].get(feat)
+        if not v: return None
+        row = Gtk.Box(spacing=10); l = Gtk.Label(label=label, xalign=0, width_chars=10); row.append(l)
+        sc = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 100, 1); sc.set_hexpand(True); sc.set_draw_value(True); sc.set_value(v["percent"])
+        if feat in ("red", "green", "blue"): sc.add_css_class(feat)
+        sc.connect("value-changed", lambda s, did=d["id"], f=feat: self.later((did, f), lambda: self.run_set(did, f, int(s.get_value())))); row.append(sc)
+        return row
+
+    def build(self, displays, profiles, note):
+        while (c := self.content.get_first_child()): self.content.remove(c)
+        self.status.set_text(note)
+        show = self.cfg["show"]; many = len(displays) > 1
+        more = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        for d in displays:
+            if many:
+                n = Gtk.Label(label=d["name"], xalign=0); n.add_css_class("heading"); self.content.append(n)
+            r = self.slider(d, "brightness", "Brightness")
+            if r: self.content.append(r)
+            if "contrast" in show:
+                r = self.slider(d, "contrast", "Contrast"); r and more.append(r)
+            if "rgb" in show:
+                for f in ("red", "green", "blue"):
+                    r = self.slider(d, f, f.capitalize()); r and more.append(r)
+            if "colour" in show and "colour" in d["values"]:
+                cb = Gtk.DropDown.new_from_strings(COLOURS); cur = d["values"]["colour"]["name"]
+                if cur in COLOURS: cb.set_selected(COLOURS.index(cur))
+                cb.connect("notify::selected", lambda w, _p, did=d["id"]: self.later((did, "colour"), lambda: self.run_set(did, "colour", COLOURS[w.get_selected()])))
+                row = Gtk.Box(spacing=10); row.append(Gtk.Label(label="Colour", xalign=0, width_chars=10)); cb.set_hexpand(True); row.append(cb); more.append(row)
+        if profiles and "looks" in show:
+            flow = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE, max_children_per_line=3, row_spacing=6, column_spacing=6)
+            for p in profiles:
+                b = Gtk.Button(label=p.capitalize()); b.add_css_class("pill"); b.connect("clicked", self.on_profile, p); flow.append(b)
+            self.content.append(flow)
+        if more.get_first_child():
+            ex = Gtk.Expander(label="More"); ex.set_child(more); self.content.append(ex)
+        if not displays: self.content.append(Gtk.Label(label="No monitor answered yet.", wrap=True))
+        btn = Gtk.Button(label="All settings"); btn.add_css_class("pill"); btn.add_css_class("suggested-action"); btn.connect("clicked", self.open_full)
+        self.content.append(btn)
+
+    def later(self, key, fn):
+        if key in self.timers: GLib.source_remove(self.timers[key])
+        def fire(): self.timers.pop(key, None); fn(); return False
+        self.timers[key] = GLib.timeout_add(300, fire)
+
+    def run_set(self, disp, feat, val):
+        def work(): rc, _, err = cli("set", feat, str(val), "--display", str(disp)); self.say("" if rc == 0 else err)
+        threading.Thread(target=work, daemon=True).start()
+
+    def on_profile(self, _b, name):
+        self.say(f"Applying {name}...")
+        def work(): rc, _, err = cli("profile", "apply", name); self.say("" if rc == 0 else err); GLib.idle_add(self.load)
+        threading.Thread(target=work, daemon=True).start()
+
+
+class App(Adw.Application):
+    """One running Glint: `glint-gui` opens the main window, `glint-gui --popup` toggles the small popup."""
+    def __init__(self):
+        super().__init__(application_id="io.github.krvats.glint", flags=Gio.ApplicationFlags.HANDLE_COMMAND_LINE)
+        self.theme = None; self.main = None; self.pop = None
+        self.connect("command-line", self.on_cmd)
+
+    def on_cmd(self, _a, cl):
+        args = cl.get_arguments()[1:]
         if self.theme is None: self.theme = Theme()
-        (self.props.active_window or Win(self)).present()
+        if "--popup" in args or "--toggle" in args: self.toggle_popup()
+        else: self.show_main()
+        return 0
+
+    def show_main(self):
+        if self.main is None: self.main = Win(self)
+        self.main.present()
+
+    def toggle_popup(self):
+        if self.pop is not None: self.pop.close(); return
+        self.pop = PopupWin(self)
+        self.pop.connect("close-request", lambda *_: (setattr(self, "pop", None), False)[1])
+        self.pop.present()
 
 
 if __name__ == "__main__":

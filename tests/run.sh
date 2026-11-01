@@ -123,4 +123,12 @@ printf 'export PATH="%s/.local/bin:$PATH" # glint-path\nalias x=y\n' "$UH" > "$U
   [ ! -e "$UH/.local/bin/glint" ] && [ ! -e "$UH/.local/bin/glint-gui" ] && [ ! -e "$UH/.local/share/glint" ] && [ ! -e "$UH/.local/share/applications/glint.desktop" ] && [ ! -e "$UH/.config/glint" ] && echo "ok: everything removed"
   grep -q "glint-path" "$UH/.bashrc" && { echo "FAIL: PATH line left"; exit 1; } || echo "ok: PATH line removed"
   grep -q "alias x=y" "$UH/.bashrc" && echo "ok: your own shell lines untouched" )
+# ---- bare `glint`, popup, pill ----
+( unset WAYLAND_DISPLAY DISPLAY
+  $C | grep -q "wearing your rice" && echo "ok: bare glint prints the terminal panel when there is no screen"
+  $C popup 2>&1 | grep -q "no screen" && echo "ok: popup explains itself without a display"
+  GLINT_QS=/nonexistent $C pill on 2>&1 | grep -q "Quickshell" && echo "ok: pill explains a missing Quickshell" )
+$C keys list | grep -q "^popup " && echo "ok: popup shortcut listed"
+$C pill status | grep -q off && echo "ok: pill off by default"
+python3 -m py_compile src/bin/glint-gui && echo "ok: gui compiles"
 echo "ALL TESTS PASSED"
