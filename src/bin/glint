@@ -4,7 +4,7 @@ Resolution, refresh rate, brightness, contrast and colour, themed like your rice
 Percent values always mean: 0 = the monitor's real lowest, 100 = the monitor's real highest."""
 import argparse, glob, json, os, pathlib, re, shutil, subprocess, sys, time
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 HYPRCTL = os.environ.get("GLINT_HYPRCTL", "hyprctl")
 HYPRDIR = pathlib.Path(os.environ.get("GLINT_HYPR_DIR", pathlib.Path(os.environ.get("XDG_CONFIG_HOME", pathlib.Path.home() / ".config")) / "hypr"))
 DDCUTIL = os.environ.get("GLINT_DDCUTIL", "ddcutil")
@@ -1274,7 +1274,7 @@ def cmd_home(a):
         print(c(203, f"  Could not read the monitor: {e}"))
     print()
     print("  " + c(183, "Try:") + "  glint step brightness +10   ·   glint profile apply night   ·   glint screen list")
-    print("  " + c(183, "Also:") + " glint popup   ·   glint keys list   ·   glint pill on   ·   glint doctor   ·   glint -h")
+    print("  " + c(183, "Also:") + " glint popup   ·   glint keys list   ·   glint pill on   ·   glint update   ·   glint doctor   ·   glint -h")
     return 0
 
 
@@ -1335,6 +1335,28 @@ def cmd_pill(a):
     return 0
 
 
+# ---------- glint update: the same one-line installer, so every update (and new feature) arrives the same way ----------
+INSTALL_URL = os.environ.get("GLINT_INSTALL_URL", "https://raw.githubusercontent.com/krvats/glint/main/install.sh")
+
+
+def cmd_update(a):
+    import tempfile, urllib.request
+    print(f"Fetching the latest Glint from {INSTALL_URL} ...")
+    try:
+        req = urllib.request.Request(INSTALL_URL, headers={"User-Agent": "glint-update"})
+        data = urllib.request.urlopen(req, timeout=30).read()
+    except Exception as e:
+        raise RuntimeError(f"could not download the installer ({e}). Check your connection, or run the install one-liner from the README.")
+    if not data.startswith(b"#!"):
+        raise RuntimeError("that did not look like the Glint installer. Nothing was changed.")
+    with tempfile.NamedTemporaryFile("wb", suffix=".sh", delete=False) as f:
+        f.write(data); path = f.name
+    try:
+        return subprocess.call(["bash", path, "--yes", "--no-deps"] + (["--dry-run"] if a.dry_run else []))
+    finally:
+        os.unlink(path)
+
+
 def main():
     base = argparse.ArgumentParser(add_help=False)
     base.add_argument("--display", type=int, help="monitor number from `glint list` (default: all)")
@@ -1379,6 +1401,8 @@ def main():
     lk.add_argument("state", choices=["on", "off"]); lk.set_defaults(f=cmd_lock)
     sub.add_parser("open", help="open the main Glint window").set_defaults(f=lambda a: (launch_gui(), 0)[1])
     sub.add_parser("popup", aliases=["toggle"], help="small quick-settings popup (run again to close)").set_defaults(f=cmd_popup)
+    up = sub.add_parser("update", aliases=["upgrade"], help="update Glint to the latest version (runs the installer for you)")
+    up.add_argument("--dry-run", action="store_true"); up.set_defaults(f=cmd_update)
     pl = sub.add_parser("pill", help="tiny hover icon next to the Caelestia shell: on | off | status")
     pl.add_argument("state", choices=["on", "off", "status", "start", "restart"], nargs="?", default="status"); pl.set_defaults(f=cmd_pill)
     a = p.parse_args()

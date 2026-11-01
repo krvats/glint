@@ -7,6 +7,7 @@ The easiest way to help is to **add your monitor**:
 Rules of the house
 - Never edit a user's file without making a `.glint-bak` backup first.
 - Everything must be reversible: `install.sh --uninstall` puts files back.
+- Every update and new feature must reach users through the install one-liner or `glint update` alone, never extra manual commands.
 - Never override a keybind the user already has.
 - Only standard VESA MCCS codes unless a monitor file proves a vendor code.
 - `bash tests/run.sh` must pass (fake monitor, no hardware needed). After changing anything in `src/`, run

@@ -117,6 +117,8 @@ Installs packages for your distro, adds the udev rule, the `i2c-dev` module and 
 
 ## 🚀 Install
 
+> Already installed? Just run `glint update`. It is the same one-liner, run for you.
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/krvats/glint/main/install.sh | bash
 ```

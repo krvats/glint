@@ -130,5 +130,6 @@ printf 'export PATH="%s/.local/bin:$PATH" # glint-path\nalias x=y\n' "$UH" > "$U
   GLINT_QS=/nonexistent $C pill on 2>&1 | grep -q "Quickshell" && echo "ok: pill explains a missing Quickshell" )
 $C keys list | grep -q "^popup " && echo "ok: popup shortcut listed"
 $C pill status | grep -q off && echo "ok: pill off by default"
+( GLINT_INSTALL_URL=file:///nonexistent $C update 2>&1 | grep -q "could not download" && echo "ok: update fails safely" )
 python3 -m py_compile src/bin/glint-gui && echo "ok: gui compiles"
 echo "ALL TESTS PASSED"
