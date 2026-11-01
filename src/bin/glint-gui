@@ -585,7 +585,7 @@ class PopupWin(Gtk.Window):
 class App(Adw.Application):
     """One running Glint: `glint-gui` opens the main window, `glint-gui --popup` toggles the small popup."""
     def __init__(self):
-        super().__init__(application_id="io.github.krvats.glint", flags=Gio.ApplicationFlags.HANDLE_COMMAND_LINE)
+        super().__init__(application_id="io.github.krvats.glint", flags=Gio.ApplicationFlags.HANDLES_COMMAND_LINE)
         self.theme = None; self.main = None; self.pop = None
         self.connect("command-line", self.on_cmd)
 

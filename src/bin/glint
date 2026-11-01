@@ -4,7 +4,7 @@ Resolution, refresh rate, brightness, contrast and colour, themed like your rice
 Percent values always mean: 0 = the monitor's real lowest, 100 = the monitor's real highest."""
 import argparse, glob, json, os, pathlib, re, shutil, subprocess, sys, time
 
-VERSION = "1.1.1"
+VERSION = "1.1.2"
 HYPRCTL = os.environ.get("GLINT_HYPRCTL", "hyprctl")
 HYPRDIR = pathlib.Path(os.environ.get("GLINT_HYPR_DIR", pathlib.Path(os.environ.get("XDG_CONFIG_HOME", pathlib.Path.home() / ".config")) / "hypr"))
 DDCUTIL = os.environ.get("GLINT_DDCUTIL", "ddcutil")
