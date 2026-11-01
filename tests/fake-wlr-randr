@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# Fake wlr-randr (0.4+) for offline tests. State in $FAKE_STATE/wlr
+S="$FAKE_STATE/wlr"; [ -f "$S" ] || echo "1920 1080 60.00 0 0 1 normal" > "$S"
+read W H R X Y SC TR < "$S"
+if [ "$1" = "--json" ]; then
+cat <<JSON
+[{"name":"HDMI-A-1","description":"Dell U2723QE","enabled":true,"position":{"x":$X,"y":$Y},"scale":$SC,"transform":"$TR",
+"modes":[{"width":3840,"height":2160,"refresh":59.997,"preferred":true,"current":false},
+{"width":1920,"height":1080,"refresh":60.0,"preferred":false,"current":$([ "$W" = 1920 ] && echo true || echo false)},
+{"width":1920,"height":1080,"refresh":143.981,"preferred":false,"current":false}]}]
+JSON
+exit 0; fi
+echo "$@" > "$FAKE_STATE/wlr-last"

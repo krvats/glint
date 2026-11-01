@@ -6,19 +6,27 @@ gi.require_version("Gtk", "4.0"); gi.require_version("Adw", "1")
 from gi.repository import Adw, Gdk, Gio, GLib, Gtk
 
 H = pathlib.Path.home()
-CFG = pathlib.Path(os.environ.get("XDG_CONFIG_HOME", H / ".config")) / "cdisplay"
+CFG = pathlib.Path(os.environ.get("XDG_CONFIG_HOME", H / ".config")) / "glint"
 SCHEME = H / ".local/state/caelestia/scheme.json"
 WAL = H / ".cache/wal/colors.json"
-_here = os.path.join(os.path.dirname(os.path.realpath(__file__)), "cdisplay")
-CLI = _here if os.path.exists(_here) else (shutil.which("cdisplay") or "cdisplay")
+_here = os.path.join(os.path.dirname(os.path.realpath(__file__)), "glint")
+CLI = _here if os.path.exists(_here) else (shutil.which("glint") or "glint")
 LABELS = {"brightness": "Brightness", "contrast": "Contrast", "red": "Red", "green": "Green", "blue": "Blue"}
 COLOURS = ["srgb", "native", "4000k", "5000k", "6500k", "7500k", "8200k", "9300k", "11500k", "user"]
 SOURCES = ["auto", "caelestia", "pywal", "gtk", "system"]
 
 
 def cli(*args):
-    r = subprocess.run([CLI, *args], capture_output=True, text=True)
-    return r.returncode, r.stdout, r.stderr.strip()
+    """Run the glint CLI. Never raises: a missing binary or a hung monitor becomes an error result, so the UI can't hang on 'loading...'."""
+    try:
+        r = subprocess.run([CLI, *args], capture_output=True, text=True, timeout=30)
+        return r.returncode, r.stdout, r.stderr.strip()
+    except FileNotFoundError:
+        return 127, "", f"Can't find the glint command ({CLI}). Reinstall Glint or add ~/.local/bin to your PATH."
+    except subprocess.TimeoutExpired:
+        return 124, "", "The monitor took too long to answer (ddcutil). Try again."
+    except Exception as e:
+        return 1, "", str(e)
 
 
 # ---------------------------------------------------------------- theme: wears your rice, live
@@ -145,17 +153,21 @@ class Win(Adw.ApplicationWindow):
     def load(self):
         self.say("Reading your monitor...")
         def work():
-            rc, out, err = cli("get", "--json")
-            _, prof, _ = cli("profile", "list", "--json")
-            _, auto, _ = cli("auto", "status")
-            src, sout, _ = cli("screen", "list", "--json")
-            krc, kout, _ = cli("keys", "list", "--json")
-            _, so, _ = cli("sync", "status"); self.sync_on = so.strip() == "on"
-            screens = json.loads(sout)["outputs"] if src == 0 and sout.strip() else []
-            keys = json.loads(kout) if krc == 0 and kout.strip() else None
-            disp = json.loads(out)["displays"] if rc == 0 else []
-            GLib.idle_add(self.build, disp, json.loads(prof or "[]") if rc == 0 else [], auto.strip() == "on", screens, keys,
-                          "" if rc == 0 else (err or "Brightness and colour need DDC/CI. Run `cdisplay doctor`."))
+            try:
+                rc, out, err = cli("get", "--json")
+                _, prof, _ = cli("profile", "list", "--json")
+                _, auto, _ = cli("auto", "status")
+                src, sout, _ = cli("screen", "list", "--json")
+                krc, kout, _ = cli("keys", "list", "--json")
+                _, so, _ = cli("sync", "status"); self.sync_on = so.strip() == "on"
+                screens = json.loads(sout)["outputs"] if src == 0 and sout.strip() else []
+                keys = json.loads(kout) if krc == 0 and kout.strip() else None
+                disp = json.loads(out)["displays"] if rc == 0 else []
+                profiles = json.loads(prof or "[]") if rc == 0 else []
+                note = "" if rc == 0 else (err or "Brightness and colour need DDC/CI. Run `glint doctor`.")
+            except Exception as e:   # whatever goes wrong, show the window instead of staying on 'loading...'
+                disp, profiles, auto, screens, keys, note = [], [], "", [], None, f"Could not read your monitor: {e}"
+            GLib.idle_add(self.build, disp, profiles, auto.strip() == "on", screens, keys, note)
         threading.Thread(target=work, daemon=True).start()
 
     def clear(self):
@@ -179,6 +191,7 @@ class Win(Adw.ApplicationWindow):
             hz.set_selected(min(range(len(rates)), key=lambda i: abs(float(rates[i]) - o["refresh"])))
         res.connect("notify::selected", fill_hz); fill_hz()
         scale = Adw.SpinRow.new_with_range(0.5, 3.0, 0.05); scale.set_title("Scale"); scale.set_digits(2); scale.set_value(float(o["scale"]))
+        scale.set_visible(o.get("can_scale", True))
         rot = Adw.ComboRow(title="Rotation", model=Gtk.StringList.new(["Normal", "Rotate 90", "Rotate 180", "Rotate 270"]))
         rot.set_selected(min(int(o["transform"]), 3))
         pos = Adw.EntryRow(title="Position (x by y, e.g. 0x0 or 2560x0)"); pos.set_text(f"{o['x']}x{o['y']}")
@@ -220,7 +233,11 @@ class Win(Adw.ApplicationWindow):
 
     # ---- keys
     def build_keys(self, keys):
-        if not keys: self.note("keys", "Shortcuts need Hyprland running."); return
+        if not keys:
+            self.note("keys", "Shortcuts are added automatically on Hyprland. On other desktops, bind these commands in your own keyboard settings:\n"
+                              "  glint-gui   (open Glint)\n  glint step brightness +10   /   glint step brightness -10\n"
+                              "  glint profile apply night   /   day   /   gaming")
+            return
         sw = Adw.SwitchRow(title="Shortcuts on", subtitle="Never overrides a shortcut you already use. Taken ones are skipped.")
         sw.set_active(keys["enabled"])
         sw.connect("notify::active", lambda r, _p: self.run_bg("keys", "on" if r.get_active() else "off"))
@@ -281,7 +298,7 @@ class Win(Adw.ApplicationWindow):
     def build(self, displays, profiles, auto, screens, keys, note):
         self.clear(); self.status.set_text(note)
         for o in screens: self.pages["screen"].append(self.build_screen(o))
-        if not screens: self.note("screen", "Screen settings need Hyprland running.")
+        if not screens: self.note("screen", "Resolution and refresh rate need Hyprland, a wlroots compositor with wlr-randr, or an X11 session with xrandr. On GNOME or KDE Wayland, use your system Settings for these; brightness and colour still work in the Colour tab.")
         for d in displays:
             grp = Adw.PreferencesGroup(title=d["name"])
             for feat, label in LABELS.items():
@@ -298,7 +315,7 @@ class Win(Adw.ApplicationWindow):
                 row.set_selected(COLOURS.index(cur) if cur in COLOURS else Gtk.INVALID_LIST_POSITION)
                 row.connect("notify::selected", self.on_colour, d["id"]); grp.add(row)
             self.pages["colour"].append(grp)
-        if not displays: self.note("colour", "Brightness and colour need DDC/CI on your monitor. Run `cdisplay doctor` for help.")
+        if not displays: self.note("colour", "No monitor answered. External monitors need DDC/CI switched on in the monitor's menu; laptop panels work automatically. Run `glint doctor` for help.")
         if profiles:
             grp = Adw.PreferencesGroup(title="One-tap looks")
             flow = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE, max_children_per_line=3, row_spacing=8, column_spacing=8)
@@ -342,7 +359,7 @@ class Win(Adw.ApplicationWindow):
 
 class App(Adw.Application):
     def __init__(self):
-        super().__init__(application_id="io.github.krvats.cdisplay")
+        super().__init__(application_id="io.github.krvats.glint")
         self.theme = None
         self.connect("activate", self.on_activate)
 

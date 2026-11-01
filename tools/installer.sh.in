@@ -17,7 +17,7 @@ Glint installer
   --no-sync      do not theme GTK/Qt apps with your Caelestia/pywal colours
   --sync         theme other apps even if no Caelestia/pywal colours exist yet
   --no-keys      do not add the Super+Alt shortcuts
-  --uninstall    remove Glint and put your files back (add --purge to drop saved settings)
+  --uninstall    remove EVERYTHING Glint added and put your files back (add --purge to also drop saved settings)
   --dry-run      show what would happen, change nothing
 U
 }
@@ -42,17 +42,29 @@ printf '%s ┃╺┓┃  ┃┃┗┫ ┃ %s\n' "$(c 156 195 255)" "$R"
 printf '%s ┗━┛┗━╸╹╹ ╹ ╹ %s  %sv%s%s\n' "$(c 139 230 255)" "$R" "$(c 169 163 207)" "$VERSION" "$R"
 printf '%s your monitor, wearing your rice%s\n' "$(c 169 163 207)" "$R"
 
-[ "$(id -u)" -eq 0 ] && SUDO="" || SUDO="sudo"
-have_sudo() { [ -z "$SUDO" ] || command -v sudo >/dev/null 2>&1; }
+if [ "$(id -u)" -eq 0 ]; then SUDO=""
+elif command -v sudo >/dev/null 2>&1; then SUDO="sudo"
+elif command -v doas >/dev/null 2>&1; then SUDO="doas"
+else SUDO="sudo"; fi
+have_sudo() { [ -z "$SUDO" ] || command -v "$SUDO" >/dev/null 2>&1; }
 
 # ---------- uninstall ----------
 if [ "$UNINSTALL" = 1 ]; then
   say "Uninstalling Glint"
-  if [ -x "$PREFIX/bin/glint" ]; then run "$PREFIX/bin/glint" uninstall $([ "$PURGE" = 1 ] && echo --purge) || true; fi
-  run rm -f "$PREFIX/bin/glint" "$PREFIX/bin/glint-gui" "$PREFIX/share/applications/glint.desktop" 
-  run rm -rf "$PREFIX/share/glint"
-  if have_sudo; then run $SUDO rm -f /etc/udev/rules.d/60-glint-i2c.rules /etc/modules-load.d/glint.conf; fi
-  ok "Removed. Packages such as ddcutil were left installed."
+  export PATH="$PREFIX/bin:$PATH"
+  if [ "$DRY" = 1 ]; then ok "would remove the program, launcher, shortcuts, theme sync, PATH lines, udev rule, module list and (with --purge) your settings"; return 0; fi
+  if command -v glint >/dev/null 2>&1; then
+    GLINT_PREFIX="$PREFIX" glint uninstall --all $([ "$PURGE" = 1 ] || echo --keep-settings) || warn "glint could not finish; removing files directly"
+  fi
+  # belt and braces: also works when glint itself is already broken or missing
+  rm -f "$PREFIX/bin/glint" "$PREFIX/bin/glint-gui" "$PREFIX/bin/cdisplay" "$PREFIX/bin/cdisplay-gui" "$PREFIX/share/applications/glint.desktop"
+  rm -rf "$PREFIX/share/glint"; rm -f "${XDG_CONFIG_HOME:-$HOME/.config}/autostart/glint-restore.desktop"
+  [ "$PURGE" = 1 ] && rm -rf "${XDG_CONFIG_HOME:-$HOME/.config}/glint" "${XDG_CONFIG_HOME:-$HOME/.config}/cdisplay"
+  if have_sudo && { [ -e /etc/udev/rules.d/60-glint-i2c.rules ] || [ -e /etc/modules-load.d/glint.conf ]; }; then
+    $SUDO sh -c "rm -f /etc/udev/rules.d/60-glint-i2c.rules /etc/modules-load.d/glint.conf; [ -f /etc/modules ] && sed -i '/^# glint-begin\$/,/^# glint-end\$/d' /etc/modules; udevadm control --reload-rules 2>/dev/null; true" </dev/null || true
+  fi
+  command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database "$PREFIX/share/applications" >/dev/null 2>&1 || true
+  ok "Glint is removed. Packages such as ddcutil were left installed (remove them with your package manager if you like)."
   return 0
 fi
 
@@ -62,7 +74,8 @@ say "Looking at your system"
 DISTRO="${PRETTY_NAME:-${NAME:-Linux}}"
 PM=""
 if [ -e /etc/NIXOS ]; then PM=nix
-else for p in pacman apt-get dnf zypper xbps-install apk; do command -v "$p" >/dev/null 2>&1 && { PM="$p"; break; }; done; fi
+elif [ -e /run/ostree-booted ] && command -v rpm-ostree >/dev/null 2>&1; then PM=rpm-ostree
+else for p in pacman apt-get dnf yum zypper xbps-install apk emerge eopkg; do command -v "$p" >/dev/null 2>&1 && { PM="$p"; break; }; done; fi
 ok "$DISTRO ${PM:+(package manager: $PM)}"
 command -v python3 >/dev/null 2>&1 || warn "python3 not found (it will be installed with the packages below)"
 
@@ -76,6 +89,10 @@ if [ "$DEPS" = 1 ]; then
     zypper)       PK="ddcutil i2c-tools python3 python3-gobject typelib-1_0-Gtk-4_0 typelib-1_0-Adw-1"; OPT="qt6ct"; I="$SUDO zypper --non-interactive install";;
     xbps-install) PK="ddcutil i2c-tools python3 python3-gobject gtk4 libadwaita"; OPT="adw-gtk3 qt6ct"; I="$SUDO xbps-install -Sy";;
     apk)          PK="ddcutil i2c-tools python3 py3-gobject3 gtk4.0 libadwaita"; OPT="adw-gtk3 qt6ct"; I="$SUDO apk add";;
+    yum)          PK="ddcutil i2c-tools python3 python3-gobject gtk4 libadwaita"; OPT="qt6ct"; I="$SUDO yum install -y";;
+    emerge)       PK="app-misc/ddcutil sys-apps/i2c-tools dev-python/pygobject gui-libs/gtk gui-libs/libadwaita"; OPT="gui-apps/qt6ct"; I="$SUDO emerge --noreplace --quiet";;
+    eopkg)        PK="ddcutil i2c-tools python3 python3-gobject libgtk-4 libadwaita"; OPT="qt6ct"; I="$SUDO eopkg install -y";;
+    rpm-ostree)   PK="ddcutil i2c-tools"; OPT=""; I="$SUDO rpm-ostree install --idempotent --allow-inactive"; warn "Immutable Fedora: packages are layered and need a reboot to appear (GTK 4 and libadwaita are already part of the image).";;
     nix)          PK=""; warn "NixOS: add ddcutil, i2c-tools, python3Packages.pygobject3, gtk4, libadwaita to your config and set hardware.i2c.enable = true;";;
     *)            PK=""; warn "Unknown package manager. Please install: ddcutil, i2c-tools, python3, PyGObject, GTK 4, libadwaita";;
   esac
@@ -92,6 +109,14 @@ if [ "$DEPS" = 1 ]; then
       for o in $OPT; do run $I "$o" >/dev/null 2>&1 && ok "$o" || warn "$o not available on $DISTRO (optional, skipped)"; done
     fi
   fi
+fi
+
+# ---------- check the pieces really are there, whatever the distro called them ----------
+if [ "$DEPS" = 1 ] && [ "$DRY" != 1 ]; then
+  command -v python3 >/dev/null 2>&1 || warn "python3 is still missing: Glint cannot run without it"
+  command -v ddcutil >/dev/null 2>&1 || warn "ddcutil not found: external monitors need it (laptop panels work without). Install a package called 'ddcutil'"
+  python3 -c "import gi; gi.require_version('Gtk','4.0'); gi.require_version('Adw','1')" >/dev/null 2>&1 \
+    || warn "The Glint window needs PyGObject, GTK 4 and libadwaita (the glint command works without them). Look for 'python3-gobject' / 'python3-gi', 'gtk4' and 'libadwaita'"
 fi
 
 # ---------- unpack and install our files ----------
@@ -131,16 +156,23 @@ if [ "${GLINT_SKIP_SYSTEM:-0}" = 1 ]; then warn "skipped (GLINT_SKIP_SYSTEM=1)"
 elif ! have_sudo; then warn "no sudo: ask an admin to install $TMP/system/* (udev rule, i2c-dev module, i2c group)"
 else
   if [ "$DRY" != 1 ]; then
+    mkdir -p "${XDG_CONFIG_HOME:-$HOME/.config}/glint"
     $SUDO sh -c '
       install -Dm644 "$1/system/60-glint-i2c.rules" /etc/udev/rules.d/60-glint-i2c.rules
-      install -Dm644 "$1/system/glint.conf" /etc/modules-load.d/glint.conf
+      if [ -d /run/systemd/system ] || [ -d /etc/modules-load.d ]; then
+        install -Dm644 "$1/system/glint.conf" /etc/modules-load.d/glint.conf
+      elif [ -f /etc/modules ] && ! grep -q "^i2c-dev" /etc/modules; then
+        printf "# glint-begin\ni2c-dev\n# glint-end\n" >> /etc/modules
+      fi
       rm -f /etc/udev/rules.d/60-cdisplay-i2c.rules /etc/modules-load.d/cdisplay.conf /usr/local/bin/cdisplay /usr/local/bin/cdisplay-gui /usr/local/share/applications/cdisplay.desktop
       modprobe i2c-dev 2>/dev/null || true
-      getent group i2c >/dev/null || groupadd -r i2c 2>/dev/null || true
-      usermod -aG i2c "$2" 2>/dev/null || true
+      getent group i2c >/dev/null || groupadd -r i2c 2>/dev/null || addgroup -S i2c 2>/dev/null || true
+      if ! id -nG "$2" 2>/dev/null | tr " " "\n" | grep -qx i2c; then
+        { usermod -aG i2c "$2" 2>/dev/null || adduser "$2" i2c 2>/dev/null || gpasswd -a "$2" i2c 2>/dev/null; } && touch "$3" || true
+      fi
       udevadm control --reload-rules 2>/dev/null || true
       udevadm trigger --subsystem-match=i2c-dev 2>/dev/null || true
-    ' _ "$TMP" "${SUDO_USER:-$USER}" </dev/null && ok "udev rule, i2c-dev module and i2c group" || warn "could not finish the system step"
+    ' _ "$TMP" "${SUDO_USER:-$USER}" "${XDG_CONFIG_HOME:-$HOME/.config}/glint/added-i2c-group" </dev/null && ok "udev rule, i2c-dev module and i2c group" || warn "could not finish the system step"
   else ok "would add udev rule, i2c-dev module and i2c group"; fi
 fi
 if command -v lspci >/dev/null 2>&1 && lspci 2>/dev/null | grep -qi nvidia && lsmod 2>/dev/null | grep -q '^nvidia '; then
@@ -154,7 +186,10 @@ else
   glint migrate >/dev/null 2>&1 && ok "settings ready" || true
   if command -v hyprctl >/dev/null 2>&1 && hyprctl version >/dev/null 2>&1; then
     if [ "$KEYS" = 1 ]; then glint keys on >/dev/null 2>&1 && ok "shortcuts added (Super+Alt+M opens Glint; taken keys were skipped)" || warn "shortcuts not added"; fi
-  else warn "Hyprland is not running here: screen settings and shortcuts activate when you run Glint inside Hyprland"; fi
+  else
+    warn "Not running inside Hyprland: Glint still controls brightness and colour. Resolution and refresh rate work here through wlr-randr (wlroots/Sway) or xrandr (X11) if installed."
+    warn "Shortcuts: bind these in your own desktop settings:  glint profile apply night   ·   glint step brightness +10   ·   glint-gui"
+  fi
   if [ "$SYNC" != no ] && { [ "$SYNC" = yes ] || [ -f "$HOME/.local/state/caelestia/scheme.json" ] || [ -f "$HOME/.cache/wal/colors.json" ]; }; then
     glint sync on 2>&1 | sed 's/^/  /' || true
   else ok "theme sync not needed (no Caelestia or pywal colours found); Glint itself will use your GTK theme"; fi
@@ -166,6 +201,7 @@ if [ "$DRY" = 1 ]; then ok "dry run finished"; else glint doctor 2>&1 | sed 's/^
 
 printf '\n%s%s✦ Done.%s Open %sGlint%s from your launcher, press %sSuper+Alt+M%s, or run %sglint --help%s\n' "$(c 214 196 255)" "$B" "$R" "$B" "$R" "$B" "$R" "$B" "$R"
 printf '%s  If you were just added to the i2c group, log out and in once.%s\n' "$(c 169 163 207)" "$R"
+printf '%s  Remove everything later with one line:  curl -fsSL https://raw.githubusercontent.com/krvats/glint/main/install.sh | bash -s -- --uninstall --purge   (or: glint uninstall --all)%s\n' "$(c 169 163 207)" "$R"
 printf '\n  %s⭐ Glint is free and tiny. If it saved you time, a star helps others find it:%s\n     %shttps://github.com/krvats/glint%s\n\n' "$(c 255 179 217)" "$R" "$(c 139 230 255)" "$R"
 }
 main "$@"

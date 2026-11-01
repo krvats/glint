@@ -83,4 +83,34 @@ grep -q "lock_cmd = qs -c caelestia ipc call lock lock" "$HOME/.config/hypr/hypr
 grep -q "dpms off" "$HOME/.config/hypr/hypridle.conf" && grep -q "dpms on" "$HOME/.config/hypr/hypridle.conf" && echo "ok: screen on/off left alone"
 $C lock-setup off >/dev/null; grep -q "terminate-user" "$HOME/.config/caelestia/shell.json" && grep -q "hyprlock" "$HOME/.config/hypr/hypridle.conf" && echo "ok: lock-setup off restores everything"
 $C report > "$HOME/report.out"; grep -q "glint-report" "$HOME/report.out" && ! grep -qi "serial" "$HOME/glint-report.txt" && echo "ok: report written without serials"
+# ---- laptop panel (no DDC at all) ----
+BL="$(mktemp -d)"; mkdir -p "$BL/intel_backlight"; echo 400 > "$BL/intel_backlight/brightness"; echo 1000 > "$BL/intel_backlight/max_brightness"; echo raw > "$BL/intel_backlight/type"
+( export GLINT_BACKLIGHT_DIR="$BL" GLINT_DDCUTIL=/nonexistent
+  python3 src/bin/glint list | grep -q "backlight intel_backlight" && echo "ok: laptop panel detected without ddcutil"
+  python3 src/bin/glint set brightness 70 >/dev/null; [ "$(cat "$BL/intel_backlight/brightness")" = 700 ] && echo "ok: panel brightness set"
+  python3 src/bin/glint set brightness 0 >/dev/null; [ "$(cat "$BL/intel_backlight/brightness")" = 1 ] && echo "ok: panel never goes fully black"
+  python3 src/bin/glint set contrast 50 2>&1 | grep -q "not supported" && echo "ok: unsupported feature explained"
+  python3 src/bin/glint doctor | grep -q "ddcutil missing" && echo "ok: doctor names the install command" )
+# ---- other compositors / X11 ----
+( export GLINT_HYPRCTL=/nonexistent GLINT_WLRRANDR="$PWD/tests/fake-wlr-randr" GLINT_XRANDR="$PWD/tests/fake-xrandr" XDG_SESSION_TYPE=wayland
+  python3 src/bin/glint screen list | grep -q "HDMI-A-1" && echo "ok: wlr-randr outputs listed"
+  python3 src/bin/glint screen list --json | python3 -c "import json,sys; o=json.load(sys.stdin)['outputs'][0]; assert o['modes']['1920x1080']==['60.00','143.98'] and o['refresh']==60.0; print('ok: wlr modes parsed')"
+  python3 src/bin/glint screen set HDMI-A-1 --resolution 1920x1080 --refresh 144 >/dev/null
+  grep -q -- "--mode 1920x1080@143.98Hz" "$FAKE_STATE/wlr-last" && echo "ok: wlr-randr called with the exact mode"
+  [ -f "$XDG_CONFIG_HOME/autostart/glint-restore.desktop" ] && echo "ok: layout re-applied at login"
+  python3 src/bin/glint screen restore >/dev/null && echo "ok: screen restore"
+  unset XDG_SESSION_TYPE; export DISPLAY=:0 GLINT_WLRRANDR=/nonexistent
+  python3 src/bin/glint screen list --json | python3 -c "import json,sys; o=json.load(sys.stdin)['outputs'][0]; assert o['name']=='eDP-1' and o['refresh']==143.98 and o['modes']['2560x1440']==['143.98','120.00','59.95'] and o['can_scale'] is False; print('ok: xrandr parsed')"
+  python3 src/bin/glint screen set eDP-1 --resolution 1920x1080 --refresh 60 >/dev/null
+  grep -q -- "--mode 1920x1080 --rate 60.00" "$FAKE_STATE/xrandr-last" && echo "ok: xrandr called" )
+# ---- one-command uninstall ----
+UH="$(mktemp -d)"; mkdir -p "$UH/.local/bin" "$UH/.local/share/glint" "$UH/.local/share/applications" "$UH/.config/glint"
+cp src/bin/glint src/bin/glint-gui "$UH/.local/bin/"; touch "$UH/.local/share/applications/glint.desktop"
+printf 'export PATH="%s/.local/bin:$PATH" # glint-path\nalias x=y\n' "$UH" > "$UH/.bashrc"
+( export HOME="$UH" XDG_CONFIG_HOME="$UH/.config" GLINT_PREFIX="$UH/.local" GLINT_HYPR_DIR="$UH/.config/hypr" PATH="/usr/bin:/bin"
+  mkdir -p "$GLINT_HYPR_DIR"; echo 'hl.monitor({})' > "$GLINT_HYPR_DIR/hyprland.lua"
+  python3 "$UH/.local/bin/glint" uninstall --all | grep -q "Glint is gone" && echo "ok: uninstall --all"
+  [ ! -e "$UH/.local/bin/glint" ] && [ ! -e "$UH/.local/bin/glint-gui" ] && [ ! -e "$UH/.local/share/glint" ] && [ ! -e "$UH/.local/share/applications/glint.desktop" ] && [ ! -e "$UH/.config/glint" ] && echo "ok: everything removed"
+  grep -q "glint-path" "$UH/.bashrc" && { echo "FAIL: PATH line left"; exit 1; } || echo "ok: PATH line removed"
+  grep -q "alias x=y" "$UH/.bashrc" && echo "ok: your own shell lines untouched" )
 echo "ALL TESTS PASSED"

@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Fake xrandr for offline tests.
+if [ "$1" = "--query" ]; then
+cat <<'X'
+Screen 0: minimum 320 x 200, current 2560 x 1440, maximum 16384 x 16384
+eDP-1 connected primary 2560x1440+0+0 (normal left inverted right x axis y axis) 597mm x 336mm
+   2560x1440     143.98*+ 120.00    59.95
+   1920x1080     143.98   60.00
+HDMI-2 disconnected (normal left inverted right x axis y axis)
+X
+exit 0; fi
+echo "$@" > "$FAKE_STATE/xrandr-last"

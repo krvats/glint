@@ -24,11 +24,28 @@ COLOUR = {"srgb": 1, "native": 2, "4000k": 3, "5000k": 4, "6500k": 5, "7500k": 6
 COLOUR_REV = {v: k for k, v in COLOUR.items()}
 
 
+def install_hint(pkg="ddcutil"):
+    """Tell the user how to install a package on THEIR distro, whichever it is."""
+    for pm, cmd in (("pacman", "sudo pacman -S"), ("apt-get", "sudo apt install"), ("dnf", "sudo dnf install"),
+                    ("zypper", "sudo zypper install"), ("xbps-install", "sudo xbps-install -S"), ("apk", "sudo apk add"),
+                    ("emerge", "sudo emerge"), ("eopkg", "sudo eopkg install"), ("rpm-ostree", "sudo rpm-ostree install")):
+        if shutil.which(pm):
+            return f"{cmd} {pkg}"
+    if os.path.exists("/etc/NIXOS"):
+        return f"add {pkg} to environment.systemPackages (and set hardware.i2c.enable = true)"
+    return f"install '{pkg}' with your package manager"
+
+
 def ddc(*args, check=True):
+    """Run ddcutil. Flaky monitors get one slower retry (and, for writes, without read-back verification)."""
+    def run(extra):
+        return subprocess.run([DDCUTIL, *extra, *args], capture_output=True, text=True, timeout=30)
     try:
-        r = subprocess.run([DDCUTIL, *args], capture_output=True, text=True, timeout=30)
+        r = run([])
+        if r.returncode != 0 and check:
+            r = run(["--sleep-multiplier", "2"] + (["--noverify"] if "setvcp" in args else []))
     except FileNotFoundError:
-        sys.exit("ddcutil is not installed. Run: sudo pacman -S ddcutil")
+        raise RuntimeError(f"ddcutil is not installed. Run: {install_hint()}")
     except subprocess.TimeoutExpired:
         raise RuntimeError("the monitor did not answer (timeout)")
     if check and r.returncode != 0:
@@ -37,8 +54,53 @@ def ddc(*args, check=True):
     return r.stdout
 
 
+# ---- laptop panels and any screen DDC/CI can't reach: the kernel's backlight, no root needed (via systemd-logind) ----
+BACKLIGHT = pathlib.Path(os.environ.get("GLINT_BACKLIGHT_DIR", "/sys/class/backlight"))
+BL_ID = 100
+
+
+def backlight_device():
+    best = None
+    rank = {"raw": 0, "platform": 1, "firmware": 2}
+    for d in sorted(BACKLIGHT.glob("*")):
+        try:
+            mx = int((d / "max_brightness").read_text()); int((d / "brightness").read_text())
+            kind = (d / "type").read_text().strip() if (d / "type").exists() else "raw"
+        except Exception:
+            continue
+        if mx > 0 and (best is None or rank.get(kind, 3) < best[0]):
+            best = (rank.get(kind, 3), d.name)
+    return best[1] if best else None
+
+
+def backlight_get(dev):
+    d = BACKLIGHT / dev
+    return {"cur": int((d / "brightness").read_text()), "max": int((d / "max_brightness").read_text())}
+
+
+def backlight_set(dev, raw):
+    raw = max(1, int(raw))            # never 0: many panels go fully black and you cannot see to undo it
+    f = BACKLIGHT / dev / "brightness"
+    if os.environ.get("GLINT_BACKLIGHT_DIR") or os.access(f, os.W_OK):
+        f.write_text(str(raw)); return
+    tries = [["busctl", "call", "org.freedesktop.login1", "/org/freedesktop/login1/session/auto", "org.freedesktop.login1.Session",
+              "SetBrightness", "ssu", "backlight", dev, str(raw)],
+             ["brightnessctl", "-q", "-d", dev, "set", str(raw)]]
+    for cmd in tries:
+        if shutil.which(cmd[0]):
+            try:
+                if subprocess.run(cmd, capture_output=True, timeout=10).returncode == 0:
+                    return
+            except Exception:
+                pass
+    raise RuntimeError("could not change the panel brightness (needs systemd-logind or brightnessctl)")
+
+
 def detect():
-    out = ddc("detect", "--brief", check=False)
+    try:
+        out = ddc("detect", "--brief", check=False)
+    except RuntimeError:
+        out = ""                      # no ddcutil: laptop panels can still work through the backlight
     mons = []
     for block in re.split(r"\n(?=Display |Invalid display|Phantom display)", out):
         m = re.match(r"Display (\d+)", block.strip())
@@ -49,6 +111,9 @@ def detect():
         parts = (mon.group(1).strip().split(":") + ["", "", ""])[:3] if mon else ["", "", ""]
         mons.append({"id": int(m.group(1)), "bus": bus.group(1) if bus else None,
                      "mfg": parts[0], "model": parts[1] or "Monitor", "serial": parts[2]})
+    dev = backlight_device()
+    if dev:
+        mons.append({"id": BL_ID, "bus": None, "backlight": dev, "mfg": "Built-in", "model": "panel", "serial": ""})
     return mons
 
 
@@ -57,6 +122,10 @@ def sel(mon):
 
 
 def getvcp(mon, feat):
+    if mon.get("backlight"):
+        if feat != "brightness":
+            raise RuntimeError(f"{feat} is not supported by a built-in panel")
+        return backlight_get(mon["backlight"])
     out = ddc(*sel(mon), "getvcp", f"{FEATURES[feat]:02X}", "--brief")
     m = re.search(r"VCP\s+[0-9A-Fa-f]{2}\s+C\s+(\d+)\s+(\d+)", out)
     if m:
@@ -68,6 +137,10 @@ def getvcp(mon, feat):
 
 
 def setvcp(mon, feat, raw):
+    if mon.get("backlight"):
+        if feat != "brightness":
+            raise RuntimeError(f"{feat} is not supported by a built-in panel")
+        return backlight_set(mon["backlight"], raw)
     ddc(*sel(mon), "setvcp", f"{FEATURES[feat]:02X}", str(int(raw)))
 
 
@@ -121,7 +194,7 @@ def cmd_list(a):
     if a.json:
         print(json.dumps(mons)); return 0
     for m in mons:
-        print(f"{m['id']}: {name(m)} (i2c-{m['bus']})")
+        print(f"{m['id']}: {name(m)} (" + (f"backlight {m['backlight']}" if m.get("backlight") else f"i2c-{m['bus']}") + ")")
     return 0 if mons else 1
 
 
@@ -196,22 +269,28 @@ def cmd_profile(a):
 def cmd_caps(a):
     for m in chosen(a):
         print(f"=== {name(m)} ===")
-        print(ddc(*sel(m), "capabilities", check=False))
+        print("built-in panel: brightness only" if m.get("backlight") else ddc(*sel(m), "capabilities", check=False))
     return 0
 
 
 def cmd_doctor(a):
     print(f"glint {VERSION} doctor\n")
+    panel = backlight_device()
     if not shutil.which(DDCUTIL):
-        print("[X] ddcutil missing. Install it (pacman -S / apt install / dnf install ddcutil) and run glint doctor again"); return 1
-    print("[OK] ddcutil found")
-    buses = glob.glob("/dev/i2c-*")
-    if not buses:
-        print("[X] no /dev/i2c-* devices -> run: sudo modprobe i2c-dev   (the installer makes this permanent)")
-    elif not any(os.access(b, os.R_OK | os.W_OK) for b in buses):
-        print("[X] no permission on /dev/i2c-* -> log out and back in once (or reboot)")
+        print(f"[{'--' if panel else 'X'}] ddcutil missing (external monitors need it). Run: {install_hint()}")
+        if not panel:
+            return 1
     else:
-        print("[OK] i2c access")
+        print("[OK] ddcutil found")
+        buses = glob.glob("/dev/i2c-*")
+        if not buses:
+            print("[X] no /dev/i2c-* devices -> run: sudo modprobe i2c-dev   (the installer makes this permanent)")
+        elif not any(os.access(b, os.R_OK | os.W_OK) for b in buses):
+            print("[X] no permission on /dev/i2c-* -> log out and back in once (or reboot)")
+        else:
+            print("[OK] i2c access")
+    if panel:
+        print(f"[OK] built-in panel backlight: {panel}")
     p = palette()
     print(f"[OK] theme: following {p['_source']} ({p['_name']}, {p['_mode']})" if p else "[--] theme: no Caelestia/pywal colours found, using your GTK theme")
     print(f"[OK] app sync: {'on' if (SYSD / 'glint-sync.path').exists() else 'off  (enable with: glint sync on)'}")
@@ -221,10 +300,11 @@ def cmd_doctor(a):
         print(f"[--] screen: {e}")
     mons = detect()
     if not mons:
-        print("[X] no monitor answered brightness/colour (DDC/CI). Some monitors have a DDC/CI switch in their menu. NVIDIA users: see the README.")
+        print("[X] no monitor answered brightness/colour (DDC/CI). Turn DDC/CI on in the monitor's own menu, or try another cable/port.")
+        print("    Docks, KVMs and some HDMI adapters block DDC. NVIDIA users: see the README. Resolution and refresh rate still work in the Screen tab.")
         return 1
     for m in mons:
-        print(f"\n[OK] {m['id']}: {name(m)} (i2c-{m['bus']})")
+        print(f"\n[OK] {m['id']}: {name(m)} (" + (f"backlight {m['backlight']}" if m.get("backlight") else f"i2c-{m['bus']}") + ")")
         for k, v in snapshot(m).items():
             print(f"      {k:11} " + (v["name"] if k == "colour" else f"{v['percent']}%   raw {v['cur']} of max {v['max']}"))
         for d in [s / "monitors" for s in SHARE]:
@@ -280,7 +360,71 @@ def hypr(*args, check=True):
     return r.stdout
 
 
-def outputs():
+WLRRANDR = os.environ.get("GLINT_WLRRANDR", "wlr-randr")
+XRANDR = os.environ.get("GLINT_XRANDR", "xrandr")
+BACKEND = None                      # "hyprland", "wlr" (sway, river, labwc, wayfire...) or "xrandr" (any X11 desktop)
+TRANSFORMS = {"normal": 0, "90": 1, "180": 2, "270": 3}
+XROT = ["normal", "left", "inverted", "right"]
+
+
+def tool(binary, *args):
+    try:
+        r = subprocess.run([binary, *args], capture_output=True, text=True, timeout=15)
+    except FileNotFoundError:
+        raise RuntimeError(f"{binary} not found")
+    if r.returncode != 0:
+        raise RuntimeError((r.stdout + r.stderr).strip() or f"{binary} failed")
+    return r.stdout
+
+
+def wlr_outputs():
+    out = []
+    for m in json.loads(tool(WLRRANDR, "--json")):
+        if not m.get("enabled", True):
+            continue
+        modes, cur = {}, None
+        for md in m.get("modes", []):
+            res, hz = f"{md['width']}x{md['height']}", f"{float(md['refresh']):.2f}"
+            modes.setdefault(res, []).append(hz)
+            if md.get("current"):
+                cur = (md["width"], md["height"], round(float(md["refresh"]), 2))
+        if not cur:
+            continue
+        pos = m.get("position", {})
+        out.append({"name": m["name"], "label": m.get("description") or m["name"], "width": cur[0], "height": cur[1], "refresh": cur[2],
+                    "x": pos.get("x", 0), "y": pos.get("y", 0), "scale": m.get("scale", 1.0),
+                    "transform": TRANSFORMS.get(str(m.get("transform", "normal")), 0), "modes": modes})
+    return out
+
+
+def xr_outputs():
+    if os.environ.get("XDG_SESSION_TYPE") == "wayland" or not os.environ.get("DISPLAY"):
+        raise RuntimeError("not an X11 session")
+    out, cur = [], None
+    for ln in tool(XRANDR, "--query").splitlines():
+        h = re.match(r"^(\S+) connected(?: primary)? (?:(\d+)x(\d+)\+(-?\d+)\+(-?\d+))?\s*(left|right|inverted)?", ln)
+        if h:
+            cur = {"name": h.group(1), "label": h.group(1), "width": 0, "height": 0, "refresh": 0.0, "x": int(h.group(4) or 0),
+                   "y": int(h.group(5) or 0), "scale": 1.0, "can_scale": False,
+                   "transform": {"left": 1, "inverted": 2, "right": 3}.get(h.group(6) or "", 0), "modes": {}}
+            out.append(cur); continue
+        if re.match(r"^\S", ln):
+            cur = None; continue
+        mm = re.match(r"^\s+(\d+x\d+)\S*\s+(.*)$", ln)
+        if mm and cur is not None:
+            for tok in mm.group(2).split():
+                rate = re.sub(r"[*+]", "", tok)
+                if not re.fullmatch(r"\d+(\.\d+)?", rate):
+                    continue
+                rate = f"{float(rate):.2f}"
+                if rate not in cur["modes"].setdefault(mm.group(1), []):
+                    cur["modes"][mm.group(1)].append(rate)
+                if "*" in tok:
+                    cur["width"], cur["height"] = (int(v) for v in mm.group(1).split("x")); cur["refresh"] = float(rate)
+    return [o for o in out if o["modes"] and o["width"]]
+
+
+def hypr_outputs():
     out = []
     for m in json.loads(hypr("monitors", "-j")):
         modes = {}
@@ -293,6 +437,21 @@ def outputs():
                     "x": m["x"], "y": m["y"], "scale": m["scale"], "transform": m.get("transform", 0),
                     "modes": modes})
     return out
+
+
+def outputs():
+    """Resolution/refresh/scale/rotation through whatever your session offers: Hyprland, wlr-randr or xrandr."""
+    global BACKEND
+    for kind, fn in (("hyprland", hypr_outputs), ("wlr", wlr_outputs), ("xrandr", xr_outputs)):
+        try:
+            found = fn()
+        except Exception:
+            continue
+        if found:
+            BACKEND = kind
+            return found
+    raise RuntimeError("Screen settings work on Hyprland, wlroots compositors (needs wlr-randr) and X11 (needs xrandr). "
+                       "On GNOME or KDE Wayland use your system Settings for resolution; brightness and colour still work here.")
 
 
 def pick_refresh(mode_list, want):
@@ -313,6 +472,20 @@ def mode_str(res, hz):
 
 
 def apply_live(name, mode, pos, scale, transform):
+    if BACKEND is None:
+        outputs()
+    res, _, hz = mode.partition("@")
+    if BACKEND == "wlr":
+        args = [WLRRANDR, "--output", name, "--mode", f"{res}@{hz}Hz" if hz else res, "--scale", str(scale),
+                "--transform", ["normal", "90", "180", "270"][int(transform) % 4]]
+        if re.fullmatch(r"-?\d+x-?\d+", pos):
+            args += ["--pos", pos.replace("x", ",")]
+        tool(*args); return
+    if BACKEND == "xrandr":
+        args = [XRANDR, "--output", name, "--mode", res] + (["--rate", hz] if hz else []) + ["--rotate", XROT[int(transform) % 4]]
+        if re.fullmatch(r"-?\d+x-?\d+", pos):
+            args += ["--pos", pos]
+        tool(*args); return
     spec = f"{name},{mode},{pos},{scale},transform,{transform}"
     try:
         r = hypr("keyword", "monitor", spec, check=False)
@@ -357,7 +530,21 @@ def install_hook():
     return str(f)
 
 
+def install_autostart():
+    """Non-Hyprland sessions: re-apply the saved layout at login (XDG autostart; wlroots users can also exec `glint screen restore`)."""
+    d = XDG / "autostart"; d.mkdir(parents=True, exist_ok=True)
+    (d / "glint-restore.desktop").write_text("[Desktop Entry]\nType=Application\nName=Glint screen layout\n"
+                                           "Exec=glint screen restore\nX-GNOME-Autostart-Delay=2\nNoDisplay=true\n")
+
+
 def cmd_screen(a):
+    if a.action == "restore":
+        state = json.load(open(SCREENS)) if SCREENS.exists() else {}
+        outs = {o["name"] for o in outputs()}
+        for n, v in state.items():
+            if n in outs:
+                apply_live(n, v["mode"], v["pos"], v["scale"], v["transform"])
+        print("layout restored"); return 0
     outs = outputs()
     if a.action == "list":
         if a.json:
@@ -368,7 +555,11 @@ def cmd_screen(a):
             print("   modes: " + ", ".join(f"{r}: {'/'.join(sorted(h, key=float, reverse=True))}" for r, h in o["modes"].items()))
         return 0
     if a.action == "persist":
-        print("Saved to " + install_hook()); return 0
+        if BACKEND == "hyprland":
+            print("Saved to " + install_hook())
+        else:
+            install_autostart(); print("Saved. It is re-applied at login (and with: glint screen restore)")
+        return 0
     o = next((x for x in outs if x["name"] == a.output), None)
     if not o:
         raise RuntimeError("unknown output. Available: " + ", ".join(x["name"] for x in outs))
@@ -391,7 +582,10 @@ def cmd_screen(a):
             state = json.load(open(SCREENS)) if SCREENS.exists() else {}
             state[o["name"]] = {"mode": mode_str(res, hz), "pos": pos, "scale": scale, "transform": tr}
             CONFIG.mkdir(parents=True, exist_ok=True); json.dump(state, open(SCREENS, "w"), indent=2)
-            write_files(state); install_hook()
+            if BACKEND == "hyprland":
+                write_files(state); install_hook()
+            else:
+                install_autostart()
         print(f"{o['name']}: {res}@{hz}, scale {scale}, rotation {tr}, position {pos}" + (" (not saved)" if a.no_save else " (saved)"))
         return 0
     if a.action == "revert":
@@ -767,9 +961,70 @@ def cmd_migrate(a):
     print("migrated"); return 0
 
 
+def _strip_lines(path, marker):
+    try:
+        t = pathlib.Path(path).read_text()
+    except OSError:
+        return
+    keep = [ln for ln in t.split("\n") if marker not in ln]
+    if keep != t.split("\n"):
+        pathlib.Path(path).write_text("\n".join(keep))
+
+
+def uninstall_everything(keep_settings):
+    """One command, everything gone: program, launcher, PATH lines, autostart, udev rule, module list, i2c group (if we added it), settings."""
+    import contextlib, io
+    prefix = pathlib.Path(os.environ.get("GLINT_PREFIX", HOME / ".local"))
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            cmd_lock(argparse.Namespace(state="off"))
+    except Exception:
+        pass
+    added_group = (CONFIG / "added-i2c-group").exists()
+    (XDG / "autostart" / "glint-restore.desktop").unlink(missing_ok=True)
+    for rc in (HOME / ".bashrc", HOME / ".zshrc", HOME / ".profile"):
+        _strip_lines(rc, "# glint-path")
+    if shutil.which("fish"):
+        sh("fish", "-c", f"set -l i (contains -i {prefix}/bin $fish_user_paths); and set -e -U fish_user_paths[$i]")
+    for f in (HYPRDIR / "hyprland.lua.glint.bak", HYPRDIR / "hyprland.conf.glint.bak"):
+        live = pathlib.Path(str(f)[:-len(".glint.bak")])
+        if f.exists() and live.exists() and f.read_text() == live.read_text():
+            f.unlink()
+    targets = [prefix / "bin/glint", prefix / "bin/glint-gui", prefix / "bin/cdisplay", prefix / "bin/cdisplay-gui",
+               prefix / "share/applications/glint.desktop", prefix / "share/applications/cdisplay.desktop"]
+    if (HERE.parent / "share/glint").exists():                 # installed somewhere other than ~/.local
+        targets += [HERE / "glint", HERE / "glint-gui", HERE.parent / "share/applications/glint.desktop"]
+        shutil.rmtree(HERE.parent / "share/glint", ignore_errors=True)
+    for t in targets:
+        t.unlink(missing_ok=True)
+    shutil.rmtree(prefix / "share/glint", ignore_errors=True)
+    sysfiles = [f for f in ("/etc/udev/rules.d/60-glint-i2c.rules", "/etc/modules-load.d/glint.conf", "/etc/udev/rules.d/60-cdisplay-i2c.rules",
+                            "/etc/modules-load.d/cdisplay.conf") if os.path.exists(f)]
+    modules_block = os.path.exists("/etc/modules") and "# glint-begin" in pathlib.Path("/etc/modules").read_text()
+    if sysfiles or modules_block or added_group:
+        script = ("rm -f " + " ".join(sysfiles or ["/dev/null"]) + "; "
+                  "[ -f /etc/modules ] && sed -i '/^# glint-begin$/,/^# glint-end$/d' /etc/modules; "
+                  + ('gpasswd -d "$1" i2c >/dev/null 2>&1 || true; ' if added_group else "") +
+                  "udevadm control --reload-rules 2>/dev/null || true")
+        cmd = ["sh", "-c", script, "_", os.environ.get("SUDO_USER") or os.environ.get("USER", "")]
+        if os.geteuid() != 0:
+            cmd = ["sudo"] + cmd if shutil.which("sudo") else (["doas"] + cmd if shutil.which("doas") else None)
+        if cmd and subprocess.run(cmd).returncode == 0:
+            print("System files removed (udev rule, module list" + (", i2c group membership" if added_group else "") + ").")
+        else:
+            print("Could not remove the system files without sudo. Delete these yourself: " + " ".join(sysfiles))
+    if not keep_settings:
+        shutil.rmtree(CONFIG, ignore_errors=True); shutil.rmtree(XDG / "cdisplay", ignore_errors=True)
+
+
 def cmd_uninstall(a):
     unhook(); cmd_sync(argparse.Namespace(action="off"))
     sh(HYPRCTL, "reload")
+    if a.all:
+        uninstall_everything(a.keep_settings)
+        print("Glint is gone: program, launcher, shortcuts, theme sync, system files" + ("" if a.keep_settings else " and your saved settings") +
+              ". Packages such as ddcutil were left installed.")
+        return 0
     if a.purge:
         shutil.rmtree(CONFIG, ignore_errors=True)
     print("Hyprland lines and theme sync removed." + ("" if a.purge else f" Your settings stay in {CONFIG} (use --purge to delete)."))
@@ -865,7 +1120,7 @@ def main():
     au = sub.add_parser("auto", parents=[base]); au.add_argument("state", choices=["on", "off", "status"], nargs="?", default="status"); au.set_defaults(f=cmd_auto)
     sm = sub.add_parser("sync-mode", parents=[base]); sm.add_argument("mode", choices=["light", "dark"]); sm.set_defaults(f=cmd_syncmode)
     sc = sub.add_parser("screen", parents=[base], help="resolution, refresh rate, scale, position, rotation")
-    sc.add_argument("action", choices=["list", "set", "persist", "revert"]); sc.add_argument("output", nargs="?")
+    sc.add_argument("action", choices=["list", "set", "persist", "revert", "restore"]); sc.add_argument("output", nargs="?")
     sc.add_argument("--resolution"); sc.add_argument("--refresh"); sc.add_argument("--scale", type=float)
     sc.add_argument("--position"); sc.add_argument("--rotate", type=int, choices=[0, 1, 2, 3])
     sc.add_argument("--no-save", action="store_true"); sc.add_argument("--to", help="mode to go back to, e.g. 1920x1080@60")
@@ -879,7 +1134,9 @@ def main():
     sy = sub.add_parser("sync", parents=[base], help="make GTK/Qt/wal apps wear your Caelestia or pywal colours")
     sy.add_argument("action", choices=["on", "off", "now", "status"], nargs="?", default="status"); sy.set_defaults(f=cmd_sync)
     sub.add_parser("migrate", parents=[base]).set_defaults(f=cmd_migrate)
-    un = sub.add_parser("uninstall", parents=[base]); un.add_argument("--purge", action="store_true"); un.set_defaults(f=cmd_uninstall)
+    un = sub.add_parser("uninstall", parents=[base]); un.add_argument("--purge", action="store_true")
+    un.add_argument("--all", action="store_true", help="remove everything Glint installed, including the program itself and system files")
+    un.add_argument("--keep-settings", action="store_true", help="with --all: keep ~/.config/glint"); un.set_defaults(f=cmd_uninstall)
     sub.add_parser("report", parents=[base], help="one shareable file for bug reports / new monitor support").set_defaults(f=cmd_report)
     lk = sub.add_parser("lock-setup", parents=[base], help="opt-in: power button locks with Caelestia's lock, nothing auto-locks")
     lk.add_argument("state", choices=["on", "off"]); lk.set_defaults(f=cmd_lock)

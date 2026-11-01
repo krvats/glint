@@ -154,11 +154,21 @@ What you will see (colours trimmed):
 | `--no-sync` | Don't theme other apps |
 | `--no-keys` | Don't add shortcuts |
 | `--dry-run` | Show what would happen, change nothing |
-| `--uninstall` | Remove Glint and put your files back (`--purge` also deletes saved settings) |
+| `--uninstall` | Remove everything Glint added and put your files back (`--purge` also deletes saved settings) |
 
 Pass options like this: `curl -fsSL <url> | bash -s -- --no-keys`
 
 **After install:** open **Glint** from your launcher, or press <kbd>Super</kbd>+<kbd>Alt</kbd>+<kbd>M</kbd>. Log out and in once if the installer just added you to the `i2c` group.
+
+### 🗑 Uninstall (one command)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/krvats/glint/main/install.sh | bash -s -- --uninstall --purge
+```
+
+Already installed? This does the same offline: `glint uninstall --all`
+
+It removes the program, launcher entry, shortcuts, Hyprland hook, theme sync, PATH lines, autostart entry, the udev rule, the `i2c-dev` module entry, your `i2c` group membership (only if Glint added it) and your saved settings. Drop `--purge` (or add `--keep-settings` to `glint uninstall --all`) to keep your settings. Packages like `ddcutil` stay installed because other tools may use them. It asks for `sudo` once for the system files.
 
 ### 🐧 Works on
 
@@ -170,11 +180,21 @@ Pass options like this: `curl -fsSL <url> | bash -s -- --no-keys`
 | openSUSE | `zypper` | 📦 package names mapped, needs your report |
 | Void | `xbps` | 📦 package names mapped, needs your report |
 | Alpine | `apk` | 📦 package names mapped, needs your report |
+| Gentoo | `emerge` | 📦 package names mapped, needs your report |
+| Solus | `eopkg` | 📦 package names mapped, needs your report |
+| Fedora Atomic / Silverblue / Bazzite | `rpm-ostree` | 📦 layers `ddcutil`, needs a reboot |
+| RHEL, Rocky, Alma | `yum` / `dnf` | 📦 package names mapped, needs your report |
 | NixOS | | 📝 prints the lines to add to your config |
+
+Any other distro: the installer checks that `ddcutil`, `python3`, PyGObject, GTK 4 and libadwaita really exist and tells you what is missing and what to look for. It also works without systemd (Alpine, Void, Artix) and with `doas` instead of `sudo`.
 
 Tried it on a distro in the 📦 rows? [Tell us how it went](https://github.com/krvats/glint/issues/new?template=bug_report.md). One line helps the next person.
 
-> **Honest scope.** Brightness, contrast and colour work on any compositor with any DDC/CI monitor. The **Screen** tab (resolution, refresh rate) speaks **Hyprland** for now. Other compositors are on the [roadmap](#-roadmap).
+> **Which screens and desktops work.**
+> - **External monitors:** brightness, contrast and colour over DDC/CI on any compositor. Turn DDC/CI on in the monitor's own menu. Docks, KVMs and some adapters block it.
+> - **Laptop panels:** brightness works automatically through the kernel backlight, no `ddcutil` needed. It never goes below 1, so the screen can't go black.
+> - **Resolution and refresh rate (Screen tab):** Hyprland, wlroots compositors (Sway, river, labwc, Wayfire, needs `wlr-randr` 0.4+) and any X11 desktop (needs `xrandr`). Saved layouts are re-applied at login. On **GNOME and KDE Wayland** use the system Settings for resolution; Glint's brightness and colour still work there.
+> - **Shortcuts:** added automatically on Hyprland. Elsewhere, bind `glint step brightness +10`, `glint profile apply night` and `glint-gui` in your desktop's keyboard settings.
 
 <details>
 <summary><b>What exactly does the installer touch?</b></summary>
@@ -347,10 +367,11 @@ Every file it edits gets a backup, nothing overrides your keybinds, and <code>--
 ## 🗺 Roadmap
 
 - [x] Brightness, contrast, RGB, colour temperature, one-tap looks
-- [x] Resolution, refresh rate, scale, rotation, position (Hyprland)
+- [x] Resolution, refresh rate, scale, rotation, position (Hyprland, wlroots via wlr-randr, X11 via xrandr)
+- [x] Laptop panel brightness without DDC · one-command uninstall
 - [x] Live theme from Caelestia, pywal, gtk.css · whole-desktop sync
-- [x] One-line installer for pacman, apt, dnf, zypper, xbps, apk
-- [ ] Screen tab for **Sway / river / niri** (wlr-randr), **KDE**, **GNOME**, **X11**
+- [x] One-line installer for pacman, apt, dnf, yum, zypper, xbps, apk, emerge, eopkg, rpm-ostree
+- [ ] Screen tab for **KDE Wayland** (kscreen-doctor) and **GNOME Wayland**, **niri**
 - [ ] VRR / HDR toggles, multi-monitor layout canvas
 - [ ] Vendor feature packs (Overdrive, Black Equalizer…) from community reports
 - [ ] AUR · Nix · Flatpak packages
