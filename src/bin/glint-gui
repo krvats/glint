@@ -591,9 +591,13 @@ class App(Adw.Application):
 
     def on_cmd(self, _a, cl):
         args = cl.get_arguments()[1:]
-        if self.theme is None: self.theme = Theme()
-        if "--popup" in args or "--toggle" in args: self.toggle_popup()
-        else: self.show_main()
+        try:
+            if self.theme is None: self.theme = Theme()
+            if "--popup" in args or "--toggle" in args: self.toggle_popup()
+            else: self.show_main()
+        except Exception:
+            import traceback; traceback.print_exc(); sys.stderr.flush()
+            if not self.get_windows(): self.quit(); return 1
         return 0
 
     def show_main(self):

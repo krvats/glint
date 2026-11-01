@@ -4,7 +4,7 @@ Resolution, refresh rate, brightness, contrast and colour, themed like your rice
 Percent values always mean: 0 = the monitor's real lowest, 100 = the monitor's real highest."""
 import argparse, glob, json, os, pathlib, re, shutil, subprocess, sys, time
 
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 HYPRCTL = os.environ.get("GLINT_HYPRCTL", "hyprctl")
 HYPRDIR = pathlib.Path(os.environ.get("GLINT_HYPR_DIR", pathlib.Path(os.environ.get("XDG_CONFIG_HOME", pathlib.Path.home() / ".config")) / "hypr"))
 DDCUTIL = os.environ.get("GLINT_DDCUTIL", "ddcutil")
@@ -1239,11 +1239,25 @@ def has_display():
     return bool(os.environ.get("WAYLAND_DISPLAY") or os.environ.get("DISPLAY"))
 
 
+GUILOG = HOME / ".cache/glint/gui.log"
+
+
 def launch_gui(*args):
+    """Start glint-gui detached. If it dies within a couple of seconds, say why (its log is kept in ~/.cache/glint/gui.log)."""
     cmd = gui_cmd(*args)
     if not cmd:
-        raise RuntimeError("glint-gui not found. Reinstall Glint, or run: bash apply-fix.sh")
-    subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, start_new_session=True)
+        raise RuntimeError("glint-gui not found. Run `glint update`.")
+    GUILOG.parent.mkdir(parents=True, exist_ok=True)
+    log = open(GUILOG, "w")
+    pr = subprocess.Popen(cmd, stdout=log, stderr=log, stdin=subprocess.DEVNULL, start_new_session=True)
+    for _ in range(20):
+        time.sleep(0.1)
+        rc = pr.poll()
+        if rc is not None:
+            tail = GUILOG.read_text().strip().splitlines()[-12:]
+            if rc != 0 or tail:
+                raise RuntimeError(f"Glint's window closed right away (exit {rc}). Last lines of {GUILOG}:\n  " + "\n  ".join(tail or ["(nothing logged)"]))
+            return
 
 
 def cmd_popup(a):
@@ -1256,7 +1270,7 @@ def cmd_popup(a):
 def cmd_home(a):
     """Plain `glint`. On a desktop: opens the main Glint window. In a bare terminal / SSH: prints a compact panel."""
     if has_display() and not getattr(a, "text", False):
-        launch_gui(); print("Opening Glint..."); return 0
+        launch_gui(); print('Opening Glint...'); return 0
     tty = sys.stdout.isatty()
     c = (lambda n, t: f"\033[38;5;{n}m{t}\033[0m") if tty else (lambda n, t: t)
     print(c(111, "  ✦ Glint") + c(245, "   your monitor, wearing your rice\n"))
